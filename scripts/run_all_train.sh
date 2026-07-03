@@ -1,23 +1,20 @@
 #!/bin/bash
 # run_all_train.sh
-# 一键训练四组实验：LIMO-817, MetaMathQA-10K, MetaMathQA-20K, OpenR1-Math-220K-10K
-# 用法: bash scripts/run_all_train.sh [BASE_MODEL] [LIMO_JSONL] [METAMATHQA_JSONL] [OPENR1_JSONL]
+# 一键训练两组实验：LIMO-817, OpenR1-Math-220K-10K
+# 用法: bash scripts/run_all_train.sh [BASE_MODEL] [LIMO_JSONL] [OPENR1_JSONL]
 # 默认 BASE_MODEL=meta-llama/Llama-3.1-8B
 # 默认 LIMO_JSONL=data/raw/limo.jsonl
-# 默认 METAMATHQA_JSONL=data/raw/metamathqa.jsonl
 # 默认 OPENR1_JSONL=data/raw/openr1_math_220k.jsonl
 
 set -e
 
 BASE_MODEL="${1:-meta-llama/Llama-3.1-8B}"
 LIMO_JSONL="${2:-data/raw/limo.jsonl}"
-METAMATHQA_JSONL="${3:-data/raw/metamathqa.jsonl}"
-OPENR1_JSONL="${4:-data/raw/openr1_math_220k.jsonl}"
+OPENR1_JSONL="${3:-data/raw/openr1_math_220k.jsonl}"
 
-echo "Base model:       $BASE_MODEL"
-echo "LIMO JSONL:       $LIMO_JSONL"
-echo "MetaMathQA JSONL: $METAMATHQA_JSONL"
-echo "OpenR1 JSONL:     $OPENR1_JSONL"
+echo "Base model:   $BASE_MODEL"
+echo "LIMO JSONL:   $LIMO_JSONL"
+echo "OpenR1 JSONL: $OPENR1_JSONL"
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
@@ -25,11 +22,6 @@ cd "$PROJECT_DIR"
 # 检查本地 JSONL 文件是否存在
 if [ ! -f "$LIMO_JSONL" ]; then
     echo "[ERROR] LIMO JSONL file not found: $LIMO_JSONL"
-    echo "Please download or prepare the data first."
-    exit 1
-fi
-if [ ! -f "$METAMATHQA_JSONL" ]; then
-    echo "[ERROR] MetaMathQA JSONL file not found: $METAMATHQA_JSONL"
     echo "Please download or prepare the data first."
     exit 1
 fi
@@ -51,20 +43,6 @@ python scripts/prepare_datasets.py \
     --dataset limo \
     --local_jsonl "$LIMO_JSONL" \
     --out data/processed/limo_817.jsonl
-
-python scripts/prepare_datasets.py \
-    --dataset metamathqa \
-    --local_jsonl "$METAMATHQA_JSONL" \
-    --out data/processed/metamathqa_10k_seed42.jsonl \
-    --sample_size 10000 \
-    --seed 42
-
-python scripts/prepare_datasets.py \
-    --dataset metamathqa \
-    --local_jsonl "$METAMATHQA_JSONL" \
-    --out data/processed/metamathqa_20k_seed42.jsonl \
-    --sample_size 20000 \
-    --seed 42
 
 python scripts/prepare_datasets.py \
     --dataset openr1 \

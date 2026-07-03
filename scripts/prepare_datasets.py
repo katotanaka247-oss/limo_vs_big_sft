@@ -10,13 +10,6 @@ prepare_datasets.py
         --out data/processed/limo_817.jsonl
 
     python scripts/prepare_datasets.py \
-        --dataset metamathqa \
-        --local_jsonl data/raw/metamathqa.jsonl \
-        --out data/processed/metamathqa_10k_seed42.jsonl \
-        --sample_size 10000 \
-        --seed 42
-
-    python scripts/prepare_datasets.py \
         --dataset openr1 \
         --local_jsonl data/raw/openr1_math_220k.jsonl \
         --out data/processed/openr1_10k_seed42.jsonl \
@@ -117,14 +110,14 @@ def process_local_jsonl(jsonl_path: str, dataset_name: str, sample_size: int = N
 def main():
     parser = argparse.ArgumentParser(description="Prepare datasets for math reasoning SFT")
     parser.add_argument("--dataset", type=str, required=True,
-                        choices=["limo", "metamathqa", "openr1"],
-                        help="Dataset name: limo, metamathqa, or openr1")
+                        choices=["limo", "openr1"],
+                        help="Dataset name: limo or openr1")
     parser.add_argument("--out", type=str, required=True,
                         help="Output JSONL file path")
     parser.add_argument("--local_jsonl", type=str, default=None,
                         help="Local JSONL file path (recommended, no download needed)")
     parser.add_argument("--sample_size", type=int, default=None,
-                        help="Random sample size (for metamathqa and openr1)")
+                        help="Random sample size (for openr1)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for sampling (default: 42)")
     args = parser.parse_args()

@@ -1,6 +1,6 @@
 # LIMO vs Big SFT: 数学推理 QLoRA 微调实验
 
-在单卡 NVIDIA L40 48GB 上，用 Llama-3.1-8B 做 QLoRA 微调，比较少量高质量数据（LIMO-817）、大规模普通数学 CoT 数据（MetaMathQA-10K/20K）和 OpenR1-Math-220k 10K 子集的效果。
+在单卡 NVIDIA L40 48GB 上，用 Llama-3.1-8B 做 QLoRA 微调，比较少量高质量数据（LIMO-817）和 OpenR1-Math-220k 10K 子集的效果。
 
 ## 环境准备
 
@@ -45,22 +45,6 @@ python scripts/prepare_datasets.py \
     --dataset limo \
     --local_jsonl data/raw/limo.jsonl \
     --out data/processed/limo_817.jsonl
-
-# 准备 MetaMathQA-10K (seed=42)
-python scripts/prepare_datasets.py \
-    --dataset metamathqa \
-    --local_jsonl data/raw/metamathqa.jsonl \
-    --out data/processed/metamathqa_10k_seed42.jsonl \
-    --sample_size 10000 \
-    --seed 42
-
-# 准备 MetaMathQA-20K (seed=42)
-python scripts/prepare_datasets.py \
-    --dataset metamathqa \
-    --local_jsonl data/raw/metamathqa.jsonl \
-    --out data/processed/metamathqa_20k_seed42.jsonl \
-    --sample_size 20000 \
-    --seed 42
 
 # 准备 OpenR1-Math-220k-10K (seed=42)
 python scripts/prepare_datasets.py \
@@ -134,22 +118,6 @@ python scripts/train_qlora_sft.py \
     --learning_rate 2e-4 \
     --max_seq_length 4096
 
-# MetaMathQA-10K (1 epoch)
-python scripts/train_qlora_sft.py \
-    --model_name meta-llama/Llama-3.1-8B \
-    --train_file data/processed/metamathqa_10k_seed42.jsonl \
-    --output_dir outputs/llama31_8b_metamathqa_10k_qlora \
-    --num_train_epochs 1 \
-    --learning_rate 2e-4
-
-# MetaMathQA-20K (1 epoch)
-python scripts/train_qlora_sft.py \
-    --model_name meta-llama/Llama-3.1-8B \
-    --train_file data/processed/metamathqa_20k_seed42.jsonl \
-    --output_dir outputs/llama31_8b_metamathqa_20k_qlora \
-    --num_train_epochs 1 \
-    --learning_rate 2e-4
-
 # OpenR1-Math-220k-10K (1 epoch)
 python scripts/train_qlora_sft.py \
     --model_name meta-llama/Llama-3.1-8B \
@@ -179,17 +147,16 @@ python scripts/train_qlora_sft.py \
 ## 一键训练
 
 ```bash
-bash scripts/run_all_train.sh [BASE_MODEL] [LIMO_JSONL] [METAMATHQA_JSONL] [OPENR1_JSONL]
+bash scripts/run_all_train.sh [BASE_MODEL] [LIMO_JSONL] [OPENR1_JSONL]
 ```
 
 默认 `BASE_MODEL=meta-llama/Llama-3.1-8B`，会自动完成：
-1. 数据准备（LIMO-817, MetaMathQA-10K, MetaMathQA-20K, OpenR1-Math-220k-10K）
-2. 四组训练（LIMO 5 epochs，其他各 1 epoch）
+1. 数据准备（LIMO-817, OpenR1-Math-220k-10K）
+2. 两组训练（LIMO 5 epochs，OpenR1 1 epoch）
 
 参数说明：
 - `BASE_MODEL`: 基础模型名（默认：meta-llama/Llama-3.1-8B）
 - `LIMO_JSONL`: LIMO 数据文件路径（默认：data/raw/limo.jsonl）
-- `METAMATHQA_JSONL`: MetaMathQA 数据文件路径（默认：data/raw/metamathqa.jsonl）
 - `OPENR1_JSONL`: OpenR1 数据文件路径（默认：data/raw/openr1_math_220k.jsonl）
 
 ## 合并 LoRA Adapter
@@ -256,29 +223,26 @@ outputs/
     adapter_model.safetensors
     tokenizer.json
     run_args.json                       # 训练参数记录
-  llama31_8b_metamathqa_10k_qlora/     # MetaMathQA-10K QLoRA adapter
-  llama31_8b_metamathqa_20k_qlora/     # MetaMathQA-20K QLoRA adapter
   llama31_8b_openr1_10k_qlora/         # OpenR1-Math-220k-10K QLoRA adapter
 
 results/
   limo_817/                             # LIMO-817 评测结果
     results.json
     samples.json
-  metamathqa_10k/                       # MetaMathQA-10K 评测结果
-  metamathqa_20k/                       # MetaMathQA-20K 评测结果
   openr1_10k/                           # OpenR1-Math-220k-10K 评测结果
 ```
 
 ## 正式训练前的 Smoke Test
 
-在正式跑完三组实验前，建议先做一次快速验证，确认环境、数据、QLoRA、adapter 保存均无问题。
+在正式训练前，建议先做一次快速验证，确认环境、数据、QLoRA、adapter 保存均无问题。
 
-### Step 1: 准备 100 条 MetaMathQA 样本
+### Step 1: 准备 100 条 LIMO 样本
 
 ```bash
 python scripts/prepare_datasets.py \
-    --dataset metamathqa \
-    --out data/processed/metamathqa_100_smoke.jsonl \
+    --dataset limo \
+    --local_jsonl data/raw/limo.jsonl \
+    --out data/processed/limo_100_smoke.jsonl \
     --sample_size 100 \
     --seed 42
 ```
@@ -288,7 +252,7 @@ python scripts/prepare_datasets.py \
 ```bash
 python scripts/train_qlora_sft.py \
     --model_name meta-llama/Llama-3.1-8B \
-    --train_file data/processed/metamathqa_100_smoke.jsonl \
+    --train_file data/processed/limo_100_smoke.jsonl \
     --output_dir outputs/smoke_test \
     --num_train_epochs 1 \
     --learning_rate 2e-4 \
@@ -315,7 +279,7 @@ ls outputs/smoke_test/
 ### Step 4: 清理
 
 ```bash
-rm -rf outputs/smoke_test data/processed/metamathqa_100_smoke.jsonl
+rm -rf outputs/smoke_test data/processed/limo_100_smoke.jsonl
 ```
 
 如果 smoke test 通过，即可运行 `bash scripts/run_all_train.sh` 开始正式实验。
@@ -346,16 +310,14 @@ rm -rf outputs/smoke_test data/processed/metamathqa_100_smoke.jsonl
 1. **Llama 模型权限**：确保已在 Hugging Face 同意 `meta-llama/Llama-3.1-8B` 模型协议
 2. **显存**：L40 48GB 可稳定运行 `max_seq_length=4096, batch_size=1, grad_accum=16`
 3. **评测任务名**：不同版本 `lm-evaluation-harness` 任务名可能不同，请用 `lm_eval ls tasks` 确认
-4. **数据字段**：脚本对 LIMO 和 MetaMathQA 的字段做了鲁棒处理，优先使用 `solution` 而非 `answer` 作为训练 completion
+4. **数据字段**：脚本对 LIMO 和 OpenR1 的字段做了鲁棒处理，优先使用 `solution` 而非 `answer` 作为训练 completion
 
 ## 实验对比目标
 
 | 实验 | 数据量 | 数据质量 | Epochs | 预期对比点 |
 |------|--------|----------|--------|-----------|
 | LIMO-817 | 817 | 高质量 | 5 | 少样本高精度 |
-| MetaMathQA-10K | 10,000 | 普通 CoT | 1 | 多样本普通精度 |
-| MetaMathQA-20K | 20,000 | 普通 CoT | 1 | 数据量扩展效果 |
-| OpenR1-Math-220k-10K | 10,000 | 高质量 CoT | 1 | 高质量 vs 普通 CoT |
+| OpenR1-Math-220k-10K | 10,000 | 高质量 CoT | 1 | 高质量少样本 vs 高质量多样本 |
 
 ### OpenR1-Math-220k 数据集说明
 
