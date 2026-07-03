@@ -10,6 +10,11 @@
 
 set -e
 
+# gen_kwargs 兼容性说明：
+# lm-evaluation-harness >= 0.4.0 支持 --gen_kwargs "do_sample=False,temperature=0.0"
+# 如果本地版本不支持，请删除 --gen_kwargs 行，或根据本地版本调整。
+# 目标：所有模型评测时使用 greedy decoding，保证公平。
+
 BASE_MODEL="${1:-meta-llama/Llama-3.1-8B}"
 MODEL_PATH="${2:-outputs/llama31_8b_limo_817_qlora}"
 OUTPUT_DIR="${3:-results/limo_817}"
@@ -48,6 +53,7 @@ lm_eval \
     --model_args "$MODEL_ARGS" \
     --tasks "$TASKS" \
     --batch_size 1 \
+    --gen_kwargs "do_sample=False,temperature=0.0" \
     --output_path "$OUTPUT_DIR" \
     --log_samples
 

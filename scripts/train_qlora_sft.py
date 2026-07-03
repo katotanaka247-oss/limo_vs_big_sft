@@ -32,55 +32,80 @@ class MathSFTDataset(TorchDataset):
     """
     读取 JSONL 文件，每行包含:
         id, source, prompt, completion
-    tokenize 时:
-        input_ids = prompt_ids + completion_ids
-        labels   = [-100]*len(prompt_ids) + completion_ids
-    超过 max_seq_length 时从右边截断。
-    返回 dict（list 格式），由 DataCollatorForSeq2Seq 负责 padding。
+    在 __init__ 中完成 tokenization 和过滤：
+        - completion 末尾追加 EOS（如果尚未存在）
+        - 超过 max_seq_length 的样本直接跳过（不截断），避免截掉数学 CoT 答案
+        - 返回 dict（list 格式），由 DataCollatorForSeq2Seq 负责 padding
+    统计信息：
+        total / kept / skipped_empty / skipped_too_long
     """
 
     def __init__(self, tokenizer, data_path: str, max_seq_length: int):
         self.tokenizer = tokenizer
         self.max_seq_length = max_seq_length
-        self.examples = []
+        self.samples = []  # 预 tokenize 后的样本列表
 
-        print(f"Loading data from {data_path} ...")
+        total = 0
+        kept = 0
+        skipped_empty = 0
+        skipped_too_long = 0
+
+        eos_token = self.tokenizer.eos_token or ""
+
+        print(f"Loading and tokenizing data from {data_path} ...")
         with open(data_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                self.examples.append(json.loads(line))
-        print(f"Loaded {len(self.examples)} examples.")
+                total += 1
+                ex = json.loads(line)
+
+                prompt = ex.get("prompt", "")
+                completion = ex.get("completion", "")
+
+                if not prompt or not completion:
+                    skipped_empty += 1
+                    continue
+
+                # tokenize prompt（不加特殊 token）
+                prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+
+                # completion 末尾确保有 EOS（prompt 部分不加 EOS）
+                completion_text = completion
+                if eos_token and not completion_text.endswith(eos_token):
+                    completion_text = completion_text + eos_token
+                completion_ids = self.tokenizer.encode(completion_text, add_special_tokens=False)
+
+                # 拼接
+                input_ids = prompt_ids + completion_ids
+
+                # labels: prompt 部分设为 -100，只对 completion 计算 loss
+                labels = [-100] * len(prompt_ids) + completion_ids
+
+                # 超过 max_seq_length 的样本跳过（不截断），避免丢失 CoT 答案
+                if len(input_ids) > self.max_seq_length:
+                    skipped_too_long += 1
+                    continue
+
+                kept += 1
+                self.samples.append({
+                    "input_ids": input_ids,
+                    "attention_mask": [1] * len(input_ids),
+                    "labels": labels,
+                })
+
+        print(f"Total: {total}, Kept: {kept}, "
+              f"Skipped (empty): {skipped_empty}, "
+              f"Skipped (too long): {skipped_too_long}")
+        if kept == 0:
+            print("[WARN] No samples kept! Check max_seq_length and data format.")
 
     def __len__(self):
-        return len(self.examples)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        ex = self.examples[idx]
-        prompt = ex["prompt"]
-        completion = ex["completion"]
-
-        # tokenize prompt 和 completion 分开
-        prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
-        completion_ids = self.tokenizer.encode(completion, add_special_tokens=False)
-
-        # 拼接
-        input_ids = prompt_ids + completion_ids
-
-        # labels: prompt 部分设为 -100，只对 completion 计算 loss
-        labels = [-100] * len(prompt_ids) + completion_ids
-
-        # 截断到 max_seq_length
-        if len(input_ids) > self.max_seq_length:
-            input_ids = input_ids[: self.max_seq_length]
-            labels = labels[: self.max_seq_length]
-
-        return {
-            "input_ids": input_ids,
-            "attention_mask": [1] * len(input_ids),
-            "labels": labels,
-        }
+        return self.samples[idx]
 
 
 def get_quantization_config():
@@ -164,8 +189,9 @@ def main():
         torch_dtype=torch.bfloat16,
     )
 
-    # 准备模型用于 kbit 训练（gradient_checkpointing 由 TrainingArguments 控制）
-    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
+    # 准备模型用于 kbit 训练（开启 gradient checkpointing 以节省显存）
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+    model.config.use_cache = False
 
     # 注入 LoRA
     print(f"\nInjecting LoRA (r={args.lora_r}, alpha={args.lora_alpha}, dropout={args.lora_dropout})...")

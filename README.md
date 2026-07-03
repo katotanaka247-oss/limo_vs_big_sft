@@ -152,6 +152,10 @@ bash scripts/run_eval_lm_eval.sh \
     "gsm8k,math500,aime24"
 ```
 
+**Note:** 评测脚本默认使用 `--gen_kwargs "do_sample=False,temperature=0.0"` 强制 greedy decoding。
+如果本地 `lm-evaluation-harness` 版本不支持 `--gen_kwargs`，请编辑 `scripts/run_eval_lm_eval.sh` 删除该行，
+或根据本地版本调整为 `--generation_kwargs`（较旧版本）。目标是所有模型评测时使用 greedy decoding，保证公平。
+
 ### 评测 Merged Model（独立模型）
 
 ```bash
@@ -193,6 +197,57 @@ results/
   metamathqa_10k/                       # MetaMathQA-10K 评测结果
   metamathqa_20k/                       # MetaMathQA-20K 评测结果
 ```
+
+## 正式训练前的 Smoke Test
+
+在正式跑完三组实验前，建议先做一次快速验证，确认环境、数据、QLoRA、adapter 保存均无问题。
+
+### Step 1: 准备 100 条 MetaMathQA 样本
+
+```bash
+python scripts/prepare_datasets.py \
+    --dataset metamathqa \
+    --out data/processed/metamathqa_100_smoke.jsonl \
+    --sample_size 100 \
+    --seed 42
+```
+
+### Step 2: 短训练（100 steps）
+
+```bash
+python scripts/train_qlora_sft.py \
+    --model_name meta-llama/Llama-3.1-8B \
+    --train_file data/processed/metamathqa_100_smoke.jsonl \
+    --output_dir outputs/smoke_test \
+    --num_train_epochs 1 \
+    --learning_rate 2e-4 \
+    --max_seq_length 4096 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 4 \
+    --save_steps 50 \
+    --logging_steps 5
+```
+
+### Step 3: 检查输出
+
+```bash
+# 确认 adapter 已保存
+ls outputs/smoke_test/
+
+# 应看到：
+#   adapter_config.json
+#   adapter_model.safetensors
+#   tokenizer.json
+#   run_args.json
+```
+
+### Step 4: 清理
+
+```bash
+rm -rf outputs/smoke_test data/processed/metamathqa_100_smoke.jsonl
+```
+
+如果 smoke test 通过，即可运行 `bash scripts/run_all_train.sh` 开始正式实验。
 
 ## 技术细节
 
