@@ -150,6 +150,8 @@ def main():
     parser.add_argument("--lora_alpha", type=int, default=64)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--save_steps", type=int, default=500)
+    parser.add_argument("--logging_steps", type=int, default=10)
     args = parser.parse_args()
 
     print("=" * 60)
@@ -214,8 +216,8 @@ def main():
         learning_rate=args.learning_rate,
         bf16=True,
         gradient_checkpointing=True,
-        logging_steps=10,
-        save_steps=500,
+        logging_steps=args.logging_steps,
+        save_steps=args.save_steps,
         save_total_limit=2,
         seed=args.seed,
         optim="paged_adamw_32bit",
