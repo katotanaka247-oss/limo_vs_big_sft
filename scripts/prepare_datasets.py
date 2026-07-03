@@ -1,172 +1,109 @@
 """
 prepare_datasets.py
-下载并预处理 LIMO 和 MetaMathQA 数据集，输出统一 JSONL 格式。
+加载本地 JSONL 数据集并转换为统一格式，输出统一 JSONL 格式。
 
 用法:
-    # 默认从 HuggingFace 下载
-    python prepare_datasets.py --dataset limo --out data/processed/limo_817.jsonl
+    # 从本地 JSONL 文件加载（推荐，无需下载）
+    python scripts/prepare_datasets.py \
+        --dataset limo \
+        --local_jsonl data/raw/limo.jsonl \
+        --out data/processed/limo_817.jsonl
 
-    # 使用国内镜像（推荐在国内服务器上运行）
+    python scripts/prepare_datasets.py \
+        --dataset metamathqa \
+        --local_jsonl data/raw/metamathqa.jsonl \
+        --out data/processed/metamathqa_10k_seed42.jsonl \
+        --sample_size 10000 \
+        --seed 42
+
+    # 从 HuggingFace 在线下载（需要网络）
     export HF_ENDPOINT=https://hf-mirror.com
-    python prepare_datasets.py --dataset limo --out data/processed/limo_817.jsonl
-
-    # 从本地目录加载（已离线下载的数据）
-    python prepare_datasets.py --dataset limo --out data/processed/limo_817.jsonl --local_data_dir data/raw/limo
+    python scripts/prepare_datasets.py --dataset limo --out data/processed/limo_817.jsonl
 """
 import argparse
 import json
 import os
 import random
-import sys
-
-# 支持通过环境变量 HF_ENDPOINT 设置镜像，例如：
-#   export HF_ENDPOINT=https://hf-mirror.com
-if os.environ.get("HF_ENDPOINT"):
-    print(f"Using HF_ENDPOINT={os.environ['HF_ENDPOINT']}")
-
-from datasets import load_dataset, load_from_disk
-
-
-# 字段候选列表，按优先级排列
-PROBLEM_FIELD_CANDIDATES = [
-    "question", "problem", "query", "input", "instruction", "prompt", "original_question"
-]
-SOLUTION_FIELD_CANDIDATES = [
-    "solution", "response", "output", "completion", "rationale", "reasoning", "answer"
-]
-
-
-def find_field(row: dict, candidates: list[str], prefer: str = None) -> str | None:
-    """
-    在 row 中按候选列表查找字段。
-    如果指定了 prefer，则优先使用 prefer 字段（如果存在且非空）。
-    """
-    if prefer and prefer in row and row[prefer] not in (None, ""):
-        return prefer
-    for c in candidates:
-        if c in row and row[c] not in (None, ""):
-            return c
-    return None
 
 
 def format_prompt(problem: str) -> str:
     return f"### Problem:\n{problem}\n\n### Solution:\n"
 
 
-def process_limo(split: str = "train", local_data_dir: str = None) -> list[dict]:
+def extract_problem_and_completion(row: dict):
     """
-    处理 GAIR/LIMO 数据集。
-    LIMO 字段: question, solution, answer
+    从 row 中提取 problem 和 completion。
+    优先使用 solution 作为 completion，避免只用短答案 answer。
+    字段检测顺序：
+      problem: question > problem > query > input > prompt
+      completion: solution > response > output > completion > rationale > reasoning
     """
-    if local_data_dir and os.path.exists(local_data_dir):
-        print(f"Loading LIMO from local dir: {local_data_dir}")
-        ds = load_from_disk(local_data_dir)
-        if split in ds:
-            ds = ds[split]
-    else:
-        print(f"Loading GAIR/LIMO ({split}) from HuggingFace...")
-        print("Tip: if timeout, set env HF_ENDPOINT=https://hf-mirror.com")
-        ds = load_dataset("GAIR/LIMO", split=split)
-    print(f"LIMO total rows: {len(ds)}")
+    # 提取 problem
+    problem = (
+        row.get("question")
+        or row.get("problem")
+        or row.get("query")
+        or row.get("input")
+        or row.get("instruction")
+        or row.get("prompt")
+        or ""
+    )
 
+    # 提取 completion（优先 solution，不要只用 answer）
+    completion = (
+        row.get("solution")
+        or row.get("response")
+        or row.get("output")
+        or row.get("completion")
+        or row.get("rationale")
+        or row.get("reasoning")
+        or ""
+    )
+
+    return str(problem).strip(), str(completion).strip()
+
+
+def process_local_jsonl(jsonl_path: str, dataset_name: str, sample_size: int = None, seed: int = 42) -> list[dict]:
+    """
+    从本地 JSONL 文件加载数据并转换为统一格式。
+    """
+    print(f"Loading {dataset_name} from local JSONL: {jsonl_path}")
     records = []
     skipped = 0
-    for i, row in enumerate(ds):
-        # LIMO 优先字段: question -> problem, solution -> completion
-        problem_field = find_field(row, PROBLEM_FIELD_CANDIDATES, prefer="question")
-        # solution 优先于 answer，因为 answer 只是短答案，solution 是完整推理
-        solution_field = find_field(row, SOLUTION_FIELD_CANDIDATES, prefer="solution")
 
-        if problem_field is None:
-            print(f"  [WARN] Row {i}: no problem field found, skipped.")
-            skipped += 1
-            continue
-        if solution_field is None:
-            print(f"  [WARN] Row {i}: no solution field found, skipped.")
-            skipped += 1
-            continue
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                continue
 
-        problem = str(row[problem_field]).strip()
-        completion = str(row[solution_field]).strip()
+            row = json.loads(line)
+            problem, completion = extract_problem_and_completion(row)
 
-        if not problem or not completion:
-            print(f"  [WARN] Row {i}: empty problem or completion, skipped.")
-            skipped += 1
-            continue
+            if not problem or not completion:
+                skipped += 1
+                continue
 
-        record = {
-            "id": f"limo_{i}",
-            "source": "GAIR/LIMO",
-            "prompt": format_prompt(problem),
-            "completion": completion,
-            "metadata": {
-                "answer": row.get("answer", ""),
-                "original_problem": problem,
+            record = {
+                "id": f"{dataset_name}_{i}",
+                "source": f"local_{dataset_name}",
+                "prompt": format_prompt(problem),
+                "completion": completion,
+                "metadata": {
+                    "answer": row.get("answer", ""),
+                    "raw_index": i
+                }
             }
-        }
-        records.append(record)
+            records.append(record)
 
-    print(f"LIMO kept: {len(records)}, skipped: {skipped}")
-    return records
-
-
-def process_metamathqa(sample_size: int = None, seed: int = 42, local_data_dir: str = None) -> list[dict]:
-    """
-    处理 meta-math/MetaMathQA 数据集。
-    随机抽样 sample_size 条，固定 seed。
-    """
-    if local_data_dir and os.path.exists(local_data_dir):
-        print(f"Loading MetaMathQA from local dir: {local_data_dir}")
-        ds = load_from_disk(local_data_dir)
-        if "train" in ds:
-            ds = ds["train"]
-    else:
-        print("Loading meta-math/MetaMathQA from HuggingFace...")
-        print("Tip: if timeout, set env HF_ENDPOINT=https://hf-mirror.com")
-        ds = load_dataset("meta-math/MetaMathQA", split="train")
-    print(f"MetaMathQA total rows: {len(ds)}")
-
-    if sample_size is not None and sample_size < len(ds):
+    # 随机抽样
+    if sample_size is not None and sample_size < len(records):
         print(f"Random sampling {sample_size} rows with seed={seed}...")
         random.seed(seed)
-        indices = random.sample(range(len(ds)), sample_size)
-        ds = ds.select(indices)
+        indices = random.sample(range(len(records)), sample_size)
+        records = [records[i] for i in indices]
 
-    records = []
-    skipped = 0
-    for i, row in enumerate(ds):
-        problem_field = find_field(row, PROBLEM_FIELD_CANDIDATES)
-        solution_field = find_field(row, SOLUTION_FIELD_CANDIDATES)
-
-        if problem_field is None:
-            print(f"  [WARN] Row {i}: no problem field found, skipped.")
-            skipped += 1
-            continue
-        if solution_field is None:
-            print(f"  [WARN] Row {i}: no solution field found, skipped.")
-            skipped += 1
-            continue
-
-        problem = str(row[problem_field]).strip()
-        completion = str(row[solution_field]).strip()
-
-        if not problem or not completion:
-            print(f"  [WARN] Row {i}: empty problem or completion, skipped.")
-            skipped += 1
-            continue
-
-        record = {
-            "id": f"metamathqa_{i}",
-            "source": "meta-math/MetaMathQA",
-            "prompt": format_prompt(problem),
-            "completion": completion,
-            "metadata": {
-                "original_problem": problem,
-            }
-        }
-        records.append(record)
-
-    print(f"MetaMathQA kept: {len(records)}, skipped: {skipped}")
+    print(f"{dataset_name} kept: {len(records)}, skipped: {skipped}")
     return records
 
 
@@ -177,24 +114,28 @@ def main():
                         help="Dataset name: limo or metamathqa")
     parser.add_argument("--out", type=str, required=True,
                         help="Output JSONL file path")
+    parser.add_argument("--local_jsonl", type=str, default=None,
+                        help="Local JSONL file path (recommended, no download needed)")
     parser.add_argument("--sample_size", type=int, default=None,
                         help="Random sample size (only for metamathqa)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for sampling (default: 42)")
-    parser.add_argument("--local_data_dir", type=str, default=None,
-                        help="Local directory containing offline dataset (optional)")
     args = parser.parse_args()
 
-    if args.dataset == "limo":
-        records = process_limo(local_data_dir=args.local_data_dir)
-    elif args.dataset == "metamathqa":
-        records = process_metamathqa(
+    # 优先使用本地 JSONL 文件
+    if args.local_jsonl and os.path.exists(args.local_jsonl):
+        records = process_local_jsonl(
+            jsonl_path=args.local_jsonl,
+            dataset_name=args.dataset,
             sample_size=args.sample_size,
-            seed=args.seed,
-            local_data_dir=args.local_data_dir
+            seed=args.seed
         )
     else:
-        raise ValueError(f"Unknown dataset: {args.dataset}")
+        if args.local_jsonl:
+            print(f"[WARN] Local JSONL file not found: {args.local_jsonl}")
+        print("[INFO] Please use --local_jsonl to specify local data file")
+        print("[INFO] Example: python scripts/prepare_datasets.py --dataset limo --local_jsonl data/raw/limo.jsonl --out data/processed/limo_817.jsonl")
+        return
 
     # 确保输出目录存在
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
