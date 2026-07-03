@@ -35,20 +35,21 @@ huggingface-cli login
 
 ## 数据准备
 
-### 方式 1：从 HuggingFace 在线下载（推荐）
+### 推荐方式：从本地 JSONL 文件加载（无需下载）
+
+将数据集文件（JSONL 格式）放到服务器本地目录，然后运行：
 
 ```bash
-# 设置国内镜像（可选，加速国内访问）
-export HF_ENDPOINT=https://hf-mirror.com
-
-# 准备 LIMO-817
+# 准备 LIMO-817（假设数据在 data/raw/limo.jsonl）
 python scripts/prepare_datasets.py \
     --dataset limo \
+    --local_jsonl data/raw/limo.jsonl \
     --out data/processed/limo_817.jsonl
 
 # 准备 MetaMathQA-10K (seed=42)
 python scripts/prepare_datasets.py \
     --dataset metamathqa \
+    --local_jsonl data/raw/metamathqa.jsonl \
     --out data/processed/metamathqa_10k_seed42.jsonl \
     --sample_size 10000 \
     --seed 42
@@ -56,60 +57,51 @@ python scripts/prepare_datasets.py \
 # 准备 MetaMathQA-20K (seed=42)
 python scripts/prepare_datasets.py \
     --dataset metamathqa \
+    --local_jsonl data/raw/metamathqa.jsonl \
     --out data/processed/metamathqa_20k_seed42.jsonl \
     --sample_size 20000 \
     --seed 42
 ```
 
-### 方式 2：从本地目录加载（离线模式）
+**字段自动检测：**
+- problem 字段：`question > problem > query > input > prompt`
+- completion 字段：`solution > response > output > completion > rationale`（优先 `solution`，不用短答案 `answer`）
 
-如果服务器无法访问 HuggingFace，可以先在能访问的机器上下载数据集，然后传到服务器。
+### 获取数据集文件
 
-**步骤 1：下载数据集到本地**
+如果还没有 JSONL 文件，可以通过以下方式获取：
+
+**方式 1：从 HuggingFace 下载（需要网络）**
 
 ```bash
-# 安装 huggingface_hub
-pip install huggingface_hub
+# 设置国内镜像
+export HF_ENDPOINT=https://hf-mirror.com
 
-# 下载 LIMO 数据集
+# 下载 LIMO
 huggingface-cli download datasets/GAIR/LIMO \
     --repo-type dataset \
-    --local-dir data/raw/limo \
+    --local-dir data/raw/limo_hf \
     --local-dir-use-symlinks False
 
-# 下载 MetaMathQA 数据集
-huggingface-cli download datasets/meta-math/MetaMathQA \
-    --repo-type dataset \
-    --local-dir data/raw/metamathqa \
-    --local-dir-use-symlinks False
+# 转换为 JSONL
+python -c "
+import json
+from datasets import load_from_disk
+ds = load_from_disk('data/raw/limo_hf')
+with open('data/raw/limo.jsonl', 'w') as f:
+    for row in ds:
+        f.write(json.dumps(row, ensure_ascii=False) + '\n')
+"
 ```
 
-**步骤 2：传到服务器并加载**
+**方式 2：手动准备 JSONL**
 
-```bash
-# 从本地目录加载（使用 --local_data_dir 参数）
-python scripts/prepare_datasets.py \
-    --dataset limo \
-    --out data/processed/limo_817.jsonl \
-    --local_data_dir data/raw/limo
-
-python scripts/prepare_datasets.py \
-    --dataset metamathqa \
-    --out data/processed/metamathqa_10k_seed42.jsonl \
-    --sample_size 10000 \
-    --seed 42 \
-    --local_data_dir data/raw/metamathqa
+如果已有其他格式的数据，手动转换为 JSONL，每行包含：
+```json
+{"question": "...", "solution": "...", "answer": "..."}
 ```
 
-### 方式 3：直接使用已处理好的 JSONL
-
-如果你已经有处理好的 JSONL 文件，可以直接跳过 `prepare_datasets.py`，在训练时指定 `--train_file`：
-
-```bash
-python scripts/train_qlora_sft.py \
-    --train_file /path/to/your/data.jsonl \
-    --output_dir outputs/your_experiment
-```
+然后运行 `prepare_datasets.py` 转换。
 
 输出格式（JSONL，每行）：
 ```json
