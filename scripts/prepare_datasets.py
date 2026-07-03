@@ -3,14 +3,28 @@ prepare_datasets.py
 下载并预处理 LIMO 和 MetaMathQA 数据集，输出统一 JSONL 格式。
 
 用法:
+    # 默认从 HuggingFace 下载
     python prepare_datasets.py --dataset limo --out data/processed/limo_817.jsonl
-    python prepare_datasets.py --dataset metamathqa --out data/processed/metamathqa_10k_seed42.jsonl --sample_size 10000 --seed 42
+
+    # 使用国内镜像（推荐在国内服务器上运行）
+    export HF_ENDPOINT=https://hf-mirror.com
+    python prepare_datasets.py --dataset limo --out data/processed/limo_817.jsonl
+
+    # 从本地目录加载（已离线下载的数据）
+    python prepare_datasets.py --dataset limo --out data/processed/limo_817.jsonl --local_data_dir data/raw/limo
 """
 import argparse
 import json
 import os
 import random
-from datasets import load_dataset
+import sys
+
+# 支持通过环境变量 HF_ENDPOINT 设置镜像，例如：
+#   export HF_ENDPOINT=https://hf-mirror.com
+if os.environ.get("HF_ENDPOINT"):
+    print(f"Using HF_ENDPOINT={os.environ['HF_ENDPOINT']}")
+
+from datasets import load_dataset, load_from_disk
 
 
 # 字段候选列表，按优先级排列
@@ -39,13 +53,20 @@ def format_prompt(problem: str) -> str:
     return f"### Problem:\n{problem}\n\n### Solution:\n"
 
 
-def process_limo(split: str = "train") -> list[dict]:
+def process_limo(split: str = "train", local_data_dir: str = None) -> list[dict]:
     """
     处理 GAIR/LIMO 数据集。
     LIMO 字段: question, solution, answer
     """
-    print(f"Loading GAIR/LIMO ({split})...")
-    ds = load_dataset("GAIR/LIMO", split=split)
+    if local_data_dir and os.path.exists(local_data_dir):
+        print(f"Loading LIMO from local dir: {local_data_dir}")
+        ds = load_from_disk(local_data_dir)
+        if split in ds:
+            ds = ds[split]
+    else:
+        print(f"Loading GAIR/LIMO ({split}) from HuggingFace...")
+        print("Tip: if timeout, set env HF_ENDPOINT=https://hf-mirror.com")
+        ds = load_dataset("GAIR/LIMO", split=split)
     print(f"LIMO total rows: {len(ds)}")
 
     records = []
@@ -89,13 +110,20 @@ def process_limo(split: str = "train") -> list[dict]:
     return records
 
 
-def process_metamathqa(sample_size: int = None, seed: int = 42) -> list[dict]:
+def process_metamathqa(sample_size: int = None, seed: int = 42, local_data_dir: str = None) -> list[dict]:
     """
     处理 meta-math/MetaMathQA 数据集。
     随机抽样 sample_size 条，固定 seed。
     """
-    print("Loading meta-math/MetaMathQA...")
-    ds = load_dataset("meta-math/MetaMathQA", split="train")
+    if local_data_dir and os.path.exists(local_data_dir):
+        print(f"Loading MetaMathQA from local dir: {local_data_dir}")
+        ds = load_from_disk(local_data_dir)
+        if "train" in ds:
+            ds = ds["train"]
+    else:
+        print("Loading meta-math/MetaMathQA from HuggingFace...")
+        print("Tip: if timeout, set env HF_ENDPOINT=https://hf-mirror.com")
+        ds = load_dataset("meta-math/MetaMathQA", split="train")
     print(f"MetaMathQA total rows: {len(ds)}")
 
     if sample_size is not None and sample_size < len(ds):
@@ -153,12 +181,18 @@ def main():
                         help="Random sample size (only for metamathqa)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for sampling (default: 42)")
+    parser.add_argument("--local_data_dir", type=str, default=None,
+                        help="Local directory containing offline dataset (optional)")
     args = parser.parse_args()
 
     if args.dataset == "limo":
-        records = process_limo()
+        records = process_limo(local_data_dir=args.local_data_dir)
     elif args.dataset == "metamathqa":
-        records = process_metamathqa(sample_size=args.sample_size, seed=args.seed)
+        records = process_metamathqa(
+            sample_size=args.sample_size,
+            seed=args.seed,
+            local_data_dir=args.local_data_dir
+        )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
 
