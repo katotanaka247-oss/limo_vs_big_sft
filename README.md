@@ -35,7 +35,12 @@ huggingface-cli login
 
 ## 数据准备
 
+### 方式 1：从 HuggingFace 在线下载（推荐）
+
 ```bash
+# 设置国内镜像（可选，加速国内访问）
+export HF_ENDPOINT=https://hf-mirror.com
+
 # 准备 LIMO-817
 python scripts/prepare_datasets.py \
     --dataset limo \
@@ -54,6 +59,56 @@ python scripts/prepare_datasets.py \
     --out data/processed/metamathqa_20k_seed42.jsonl \
     --sample_size 20000 \
     --seed 42
+```
+
+### 方式 2：从本地目录加载（离线模式）
+
+如果服务器无法访问 HuggingFace，可以先在能访问的机器上下载数据集，然后传到服务器。
+
+**步骤 1：下载数据集到本地**
+
+```bash
+# 安装 huggingface_hub
+pip install huggingface_hub
+
+# 下载 LIMO 数据集
+huggingface-cli download datasets/GAIR/LIMO \
+    --repo-type dataset \
+    --local-dir data/raw/limo \
+    --local-dir-use-symlinks False
+
+# 下载 MetaMathQA 数据集
+huggingface-cli download datasets/meta-math/MetaMathQA \
+    --repo-type dataset \
+    --local-dir data/raw/metamathqa \
+    --local-dir-use-symlinks False
+```
+
+**步骤 2：传到服务器并加载**
+
+```bash
+# 从本地目录加载（使用 --local_data_dir 参数）
+python scripts/prepare_datasets.py \
+    --dataset limo \
+    --out data/processed/limo_817.jsonl \
+    --local_data_dir data/raw/limo
+
+python scripts/prepare_datasets.py \
+    --dataset metamathqa \
+    --out data/processed/metamathqa_10k_seed42.jsonl \
+    --sample_size 10000 \
+    --seed 42 \
+    --local_data_dir data/raw/metamathqa
+```
+
+### 方式 3：直接使用已处理好的 JSONL
+
+如果你已经有处理好的 JSONL 文件，可以直接跳过 `prepare_datasets.py`，在训练时指定 `--train_file`：
+
+```bash
+python scripts/train_qlora_sft.py \
+    --train_file /path/to/your/data.jsonl \
+    --output_dir outputs/your_experiment
 ```
 
 输出格式（JSONL，每行）：
