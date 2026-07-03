@@ -1,6 +1,6 @@
 # LIMO vs Big SFT: 数学推理 QLoRA 微调实验
 
-在单卡 NVIDIA L40 48GB 上，用 Llama-3.1-8B 做 QLoRA 微调，比较少量高质量数据（LIMO-817）和大规模普通数学 CoT 数据（MetaMathQA-10K/20K）的效果。
+在单卡 NVIDIA L40 48GB 上，用 Llama-3.1-8B 做 QLoRA 微调，比较少量高质量数据（LIMO-817）、大规模普通数学 CoT 数据（MetaMathQA-10K/20K）和 OpenR1-Math-220k 10K 子集的效果。
 
 ## 环境准备
 
@@ -60,6 +60,14 @@ python scripts/prepare_datasets.py \
     --local_jsonl data/raw/metamathqa.jsonl \
     --out data/processed/metamathqa_20k_seed42.jsonl \
     --sample_size 20000 \
+    --seed 42
+
+# 准备 OpenR1-Math-220k-10K (seed=42)
+python scripts/prepare_datasets.py \
+    --dataset openr1 \
+    --local_jsonl data/raw/openr1_math_220k.jsonl \
+    --out data/processed/openr1_10k_seed42.jsonl \
+    --sample_size 10000 \
     --seed 42
 ```
 
@@ -141,6 +149,14 @@ python scripts/train_qlora_sft.py \
     --output_dir outputs/llama31_8b_metamathqa_20k_qlora \
     --num_train_epochs 1 \
     --learning_rate 2e-4
+
+# OpenR1-Math-220k-10K (1 epoch)
+python scripts/train_qlora_sft.py \
+    --model_name meta-llama/Llama-3.1-8B \
+    --train_file data/processed/openr1_10k_seed42.jsonl \
+    --output_dir outputs/llama31_8b_openr1_10k_qlora \
+    --num_train_epochs 1 \
+    --learning_rate 2e-4
 ```
 
 ### 训练参数说明
@@ -163,12 +179,18 @@ python scripts/train_qlora_sft.py \
 ## 一键训练
 
 ```bash
-bash scripts/run_all_train.sh [BASE_MODEL]
+bash scripts/run_all_train.sh [BASE_MODEL] [LIMO_JSONL] [METAMATHQA_JSONL] [OPENR1_JSONL]
 ```
 
 默认 `BASE_MODEL=meta-llama/Llama-3.1-8B`，会自动完成：
-1. 数据准备（LIMO-817, MetaMathQA-10K, MetaMathQA-20K）
-2. 三组训练（LIMO 5 epochs，MetaMathQA 各 1 epoch）
+1. 数据准备（LIMO-817, MetaMathQA-10K, MetaMathQA-20K, OpenR1-Math-220k-10K）
+2. 四组训练（LIMO 5 epochs，其他各 1 epoch）
+
+参数说明：
+- `BASE_MODEL`: 基础模型名（默认：meta-llama/Llama-3.1-8B）
+- `LIMO_JSONL`: LIMO 数据文件路径（默认：data/raw/limo.jsonl）
+- `METAMATHQA_JSONL`: MetaMathQA 数据文件路径（默认：data/raw/metamathqa.jsonl）
+- `OPENR1_JSONL`: OpenR1 数据文件路径（默认：data/raw/openr1_math_220k.jsonl）
 
 ## 合并 LoRA Adapter
 
@@ -236,6 +258,7 @@ outputs/
     run_args.json                       # 训练参数记录
   llama31_8b_metamathqa_10k_qlora/     # MetaMathQA-10K QLoRA adapter
   llama31_8b_metamathqa_20k_qlora/     # MetaMathQA-20K QLoRA adapter
+  llama31_8b_openr1_10k_qlora/         # OpenR1-Math-220k-10K QLoRA adapter
 
 results/
   limo_817/                             # LIMO-817 评测结果
@@ -243,6 +266,7 @@ results/
     samples.json
   metamathqa_10k/                       # MetaMathQA-10K 评测结果
   metamathqa_20k/                       # MetaMathQA-20K 评测结果
+  openr1_10k/                           # OpenR1-Math-220k-10K 评测结果
 ```
 
 ## 正式训练前的 Smoke Test
@@ -331,3 +355,35 @@ rm -rf outputs/smoke_test data/processed/metamathqa_100_smoke.jsonl
 | LIMO-817 | 817 | 高质量 | 5 | 少样本高精度 |
 | MetaMathQA-10K | 10,000 | 普通 CoT | 1 | 多样本普通精度 |
 | MetaMathQA-20K | 20,000 | 普通 CoT | 1 | 数据量扩展效果 |
+| OpenR1-Math-220k-10K | 10,000 | 高质量 CoT | 1 | 高质量 vs 普通 CoT |
+
+### OpenR1-Math-220k 数据集说明
+
+OpenR1-Math-220k 是 Open R1 项目使用的数学推理数据集，包含 220K 条高质量的数学问题和解答。
+
+**获取数据集（本地处理）：**
+
+由于在服务器上可能无法直接访问 HuggingFace，建议在本地处理数据后手动上传到服务器：
+
+```python
+# 本地运行：下载并转换为 JSONL
+from datasets import load_dataset
+import json
+
+# 加载数据集
+ds = load_dataset("open-r1/OpenR1-Math-220k", split="train")
+
+# 转换为 JSONL
+with open("openr1_math_220k.jsonl", "w", encoding="utf-8") as f:
+    for row in ds:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+print(f"Saved {len(ds)} rows to openr1_math_220k.jsonl")
+```
+
+**字段说明：**
+- `problem`: 数学问题
+- `solution`: 详细解答（包含 CoT）
+- `answer`: 最终答案
+
+然后将生成的 `openr1_math_220k.jsonl` 文件上传到服务器的 `data/raw/` 目录。

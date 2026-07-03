@@ -1,20 +1,23 @@
 #!/bin/bash
 # run_all_train.sh
-# 一键训练三组实验：LIMO-817, MetaMathQA-10K, MetaMathQA-20K
-# 用法: bash scripts/run_all_train.sh [BASE_MODEL] [LIMO_JSONL] [METAMATHQA_JSONL]
+# 一键训练四组实验：LIMO-817, MetaMathQA-10K, MetaMathQA-20K, OpenR1-Math-220K-10K
+# 用法: bash scripts/run_all_train.sh [BASE_MODEL] [LIMO_JSONL] [METAMATHQA_JSONL] [OPENR1_JSONL]
 # 默认 BASE_MODEL=meta-llama/Llama-3.1-8B
 # 默认 LIMO_JSONL=data/raw/limo.jsonl
 # 默认 METAMATHQA_JSONL=data/raw/metamathqa.jsonl
+# 默认 OPENR1_JSONL=data/raw/openr1_math_220k.jsonl
 
 set -e
 
 BASE_MODEL="${1:-meta-llama/Llama-3.1-8B}"
 LIMO_JSONL="${2:-data/raw/limo.jsonl}"
 METAMATHQA_JSONL="${3:-data/raw/metamathqa.jsonl}"
+OPENR1_JSONL="${4:-data/raw/openr1_math_220k.jsonl}"
 
 echo "Base model:       $BASE_MODEL"
 echo "LIMO JSONL:       $LIMO_JSONL"
 echo "MetaMathQA JSONL: $METAMATHQA_JSONL"
+echo "OpenR1 JSONL:     $OPENR1_JSONL"
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
@@ -27,6 +30,11 @@ if [ ! -f "$LIMO_JSONL" ]; then
 fi
 if [ ! -f "$METAMATHQA_JSONL" ]; then
     echo "[ERROR] MetaMathQA JSONL file not found: $METAMATHQA_JSONL"
+    echo "Please download or prepare the data first."
+    exit 1
+fi
+if [ ! -f "$OPENR1_JSONL" ]; then
+    echo "[ERROR] OpenR1 JSONL file not found: $OPENR1_JSONL"
     echo "Please download or prepare the data first."
     exit 1
 fi
@@ -56,6 +64,13 @@ python scripts/prepare_datasets.py \
     --local_jsonl "$METAMATHQA_JSONL" \
     --out data/processed/metamathqa_20k_seed42.jsonl \
     --sample_size 20000 \
+    --seed 42
+
+python scripts/prepare_datasets.py \
+    --dataset openr1 \
+    --local_jsonl "$OPENR1_JSONL" \
+    --out data/processed/openr1_10k_seed42.jsonl \
+    --sample_size 10000 \
     --seed 42
 
 # ============================================
@@ -124,6 +139,28 @@ python scripts/train_qlora_sft.py \
     --lora_dropout 0.05 \
     --seed 42
 
+# ============================================
+# 5. 训练 OpenR1-Math-220k-10K (1 epoch)
+# ============================================
+echo ""
+echo "=========================================="
+echo "Step 5: Training OpenR1-Math-220k-10K (1 epoch)"
+echo "=========================================="
+
+python scripts/train_qlora_sft.py \
+    --model_name "$BASE_MODEL" \
+    --train_file data/processed/openr1_10k_seed42.jsonl \
+    --output_dir outputs/llama31_8b_openr1_10k_qlora \
+    --num_train_epochs 1 \
+    --learning_rate 2e-4 \
+    --max_seq_length 4096 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 16 \
+    --lora_r 32 \
+    --lora_alpha 64 \
+    --lora_dropout 0.05 \
+    --seed 42
+
 echo ""
 echo "=========================================="
 echo "All training done!"
@@ -131,4 +168,5 @@ echo "Outputs:"
 echo "  LIMO-817:        outputs/llama31_8b_limo_817_qlora"
 echo "  MetaMathQA-10K:  outputs/llama31_8b_metamathqa_10k_qlora"
 echo "  MetaMathQA-20K:  outputs/llama31_8b_metamathqa_20k_qlora"
+echo "  OpenR1-10K:      outputs/llama31_8b_openr1_10k_qlora"
 echo "=========================================="
