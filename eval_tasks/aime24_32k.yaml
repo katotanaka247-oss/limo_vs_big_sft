@@ -1,0 +1,29 @@
+# local_aime24_32k
+# AIME 2024 任务，最大生成长度 32768 tokens。
+# 数据集: Maxwell-Jia/AIME_2024 (train split, 注意该数据集用 train 存放 2024 题目)
+# prompt: stock zero-shot "Question: {Problem}\nAnswer:"
+# 字段名注意: AIME24 数据集的题目字段是大写 Problem / Answer
+# 评分: 从 lm-eval 0.4.5 hendrycks_math/utils.py 移植的 is_equiv 数学等价判定
+#        AIME 答案为 0-999 整数，is_equiv 经 strip_string 归一化后可正确判定
+task: local_aime24_32k
+dataset_path: Maxwell-Jia/AIME_2024
+test_split: train
+output_type: generate_until
+doc_to_text: "Question: {{Problem}}\nAnswer:"
+doc_to_target: "{{Answer}}"
+process_results: !function math_utils.process_results
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+generation_kwargs:
+  until:
+    - "</s>"
+    - "<|eot_id|>"
+  do_sample: false
+  temperature: 0.0
+  max_gen_toks: 32768
+repeats: 1
+num_fewshot: 0
+metadata:
+  version: 1.0

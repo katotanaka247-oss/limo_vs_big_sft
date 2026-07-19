@@ -1,0 +1,34 @@
+# requirements-eval-vllm-cu121.txt
+# 单卡 L40 vLLM 评测专用依赖（基于 limo_sft 训练环境克隆，CUDA 12.1）
+#
+# ⚠️ 安装方式（不修改原训练环境 limo_sft）:
+#   conda create -n limo_eval_vllm --clone limo_sft -y
+#   conda activate limo_eval_vllm
+#   python -m pip install "vllm==0.6.6.post1"
+#
+# 安装后必须执行 `python -m pip check` 并核对核心包未被改动:
+#   torch==2.5.1+cu121 / transformers==4.46.3 / lm-eval==0.4.5 / peft==0.13.2
+# 若 vllm 安装改动了上述核心包，必须回滚，不能继续。
+#
+# 版本选择依据:
+#   * 不升级 limo_sft 中的 torch / transformers / peft / accelerate / lm-eval；
+#   * vllm==0.6.6.post1 是与 torch 2.5.1+cu121 / transformers 4.46.3 兼容的版本，
+#     其 LLM.__init__ 通过 **kwargs 透传 EngineArgs，支持 max_model_len /
+#     max_num_batched_tokens / max_num_seqs / enable_prefix_caching；
+#   * lm-eval==0.4.5 的 vLLM backend (lm_eval.models.vllm_causallms.VLLM) 通过
+#     **kwargs 把这些参数透传给 vllm.LLM，因此脚本中可使用这些参数；
+#   * lm-eval 0.4.5 不含 aime24/aime25/hendrycks_math500 内置任务，
+#     本仓库通过 eval_tasks/ 本地任务 + --include_path 提供；
+#   * vllm 0.6.6.post1 会自动安装 xformers==0.0.28.post3 等依赖，属正常。
+#
+# 以下仅列出 vllm 安装之外的补充依赖（limo_sft 已含 torch/transformers/peft 等，不重复指定版本）。
+# 注意: torch 必须保持 limo_sft 的 2.5.1+cu121，不能让 vllm 拉成 2.5.1+cu124 或其他。
+
+# vLLM 主体（会自动带入兼容的 xformers / ray 等）
+vllm==0.6.6.post1
+
+# 数学答案校验（lm-eval 0.4.5 hendrycks_math 的 is_equiv 不依赖此包，但部分任务用）
+math_verify==0.7.0
+
+# lm-eval 0.4.5 已在 limo_sft 中，这里只做版本声明以便 pip check
+# lm_eval==0.4.5
