@@ -23,6 +23,15 @@ generation-only 效率统计：从 manifest 精确读取 sample 文件，统计�
   - fallback_level
   - config_comparable / throughput_comparable
   - generation_complete
+  - enable_chunked_prefill (纳入配置比较)
+
+token 统计来源 (优先级):
+  1. 导出 JSONL (run_manifest.json 的 exported_generation_files)
+     -> 直接读取 output_token_count (真实 tokenizer 计数)
+     -> 同时检查 output_token_count_method 是否为 llama_tokenizer
+  2. lm-eval sample 文件 (回退)
+     -> 使用 validate_generation_task.extract_output 提取输出
+     -> token 估算为 split 计数
 """
 import argparse
 import json
@@ -30,6 +39,9 @@ import os
 import statistics
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from validate_generation_task import extract_output, extract_doc_id, extract_prompt
 
 
 def _load_json(path):
@@ -85,20 +97,40 @@ def _percentile(data, p):
     return sorted_data[f] + (sorted_data[c] - sorted_data[f]) * (k - f)
 
 
+def _empty_stats(file_field_name, extra=None):
+    """返回空统计字典（当文件不存在时）。"""
+    result = {
+        "sample_file": "",
+        "actual_samples": 0,
+        "empty_output_count": 0,
+        "duplicate_count": 0,
+        "output_token_counts": [],
+        "total_output_tokens": 0,
+        "avg_output_tokens": 0,
+        "p50": 0, "p90": 0, "p95": 0, "max_output_tokens": 0,
+        "possibly_truncated_count": 0,
+        "token_count_method": "",
+        "method_warnings": [],
+    }
+    if extra:
+        result.update(extra)
+    if file_field_name:
+        result[file_field_name] = ""
+    return result
+
+
 def _analyze_sample_file(sample_file, max_gen_toks=32768):
-    """分析单个 sample JSONL 文件，返回统计。"""
+    """分析单个 lm-eval sample JSONL 文件，返回统计。
+
+    回退模式：当导出 JSONL 不存在时使用。
+    使用 extract_output 提取输出，token 估算为 split 计数。
+    使用 extract_doc_id 提取 doc_id（修复 0 falsy bug）。
+    """
     if not sample_file or not os.path.isfile(sample_file):
-        return {
+        return _empty_stats("sample_file", {
             "sample_file": sample_file,
-            "actual_samples": 0,
-            "empty_output_count": 0,
-            "duplicate_count": 0,
-            "output_token_counts": [],
-            "total_output_tokens": 0,
-            "avg_output_tokens": 0,
-            "p50": 0, "p90": 0, "p95": 0, "max_output_tokens": 0,
-            "possibly_truncated_count": 0,
-        }
+            "token_count_method": "split_estimate",
+        })
 
     token_counts = []
     seen_ids = set()
@@ -109,7 +141,7 @@ def _analyze_sample_file(sample_file, max_gen_toks=32768):
     LIMIT_THRESHOLD = max_gen_toks - 8
 
     with open(sample_file, encoding="utf-8") as f:
-        for line in f:
+        for line_num, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
@@ -118,32 +150,18 @@ def _analyze_sample_file(sample_file, max_gen_toks=32768):
             except json.JSONDecodeError:
                 continue
 
-            # doc_id 唯一性（注意: 0 是有效的 doc_id，不能用 or 链）
-            did = obj.get("doc_id")
-            if did is None:
-                did = obj.get("id")
-            if did is not None:
-                if did in seen_ids:
-                    duplicate_count += 1
-                seen_ids.add(did)
+            # doc_id 唯一性（使用 extract_doc_id，修复 0 是有效 doc_id 的 bug）
+            did = extract_doc_id(obj, line_num)
+            if did in seen_ids:
+                duplicate_count += 1
+            seen_ids.add(did)
 
-            # 提取输出
-            raw_output = ""
-            if "raw_output" in obj:
-                raw_output = str(obj.get("raw_output", ""))
-            else:
-                resps = obj.get("resps") or obj.get("filtered_resps")
-                if resps and isinstance(resps, list) and len(resps) > 0:
-                    first = resps[0]
-                    if isinstance(first, list) and len(first) > 0:
-                        raw_output = str(first[0])
-                    elif isinstance(first, str):
-                        raw_output = first
-
+            # 提取输出（使用 validate_generation_task.extract_output）
+            raw_output = extract_output(obj)
             if not raw_output.strip():
                 empty_count += 1
 
-            # token 估算
+            # token 估算（回退模式：空格 split）
             token_count = len(raw_output.split()) if raw_output else 0
             token_counts.append(token_count)
             total_tokens += token_count
@@ -162,6 +180,99 @@ def _analyze_sample_file(sample_file, max_gen_toks=32768):
         "p95": int(_percentile(token_counts, 95)),
         "max_output_tokens": max(token_counts) if token_counts else 0,
         "possibly_truncated_count": sum(1 for t in token_counts if t >= LIMIT_THRESHOLD),
+        "token_count_method": "split_estimate",
+        "method_warnings": [],
+    }
+
+
+def _analyze_exported_file(exported_file, max_gen_toks=32768):
+    """分析导出的统一 JSONL 文件，返回统计。
+
+    优先模式：output_token_count 已经是真实 tokenizer 计数。
+    同时检查 output_token_count_method 是否为 llama_tokenizer，
+    若存在且不等于 'llama_tokenizer' 则标记警告。
+    """
+    if not exported_file or not os.path.isfile(exported_file):
+        return _empty_stats("sample_file", {
+            "sample_file": exported_file,
+            "token_count_method": "exported_output_token_count",
+        })
+
+    token_counts = []
+    seen_ids = set()
+    empty_count = 0
+    duplicate_count = 0
+    total_tokens = 0
+    method_warnings = []
+    methods_seen = set()
+
+    LIMIT_THRESHOLD = max_gen_toks - 8
+
+    with open(exported_file, encoding="utf-8") as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            # sample_id 唯一性（导出文件规范字段）
+            sid = record.get("sample_id")
+            if sid is not None:
+                if sid in seen_ids:
+                    duplicate_count += 1
+                seen_ids.add(sid)
+            else:
+                # 回退到 doc_id（同样使用 extract_doc_id 修复 0 falsy bug）
+                did = extract_doc_id(record, line_num)
+                if did in seen_ids:
+                    duplicate_count += 1
+                seen_ids.add(did)
+
+            # 提取 raw_output
+            raw_output = str(record.get("raw_output", ""))
+            if not raw_output.strip():
+                empty_count += 1
+
+            # token count（已经是真实 tokenizer 计数）
+            try:
+                token_count = int(record.get("output_token_count", 0) or 0)
+            except (TypeError, ValueError):
+                token_count = 0
+            token_counts.append(token_count)
+            total_tokens += token_count
+
+            # 检查 output_token_count_method
+            method = record.get("output_token_count_method", "")
+            if method:
+                methods_seen.add(method)
+                if method != "llama_tokenizer":
+                    method_warnings.append(
+                        f"line {line_num}: output_token_count_method='{method}'"
+                    )
+
+    # 去重警告
+    method_warnings = list(dict.fromkeys(method_warnings))
+
+    n = len(token_counts)
+    return {
+        "sample_file": exported_file,
+        "actual_samples": n,
+        "empty_output_count": empty_count,
+        "duplicate_count": duplicate_count,
+        "output_token_counts": token_counts,
+        "total_output_tokens": total_tokens,
+        "avg_output_tokens": round(total_tokens / n, 1) if n > 0 else 0,
+        "p50": int(_percentile(token_counts, 50)),
+        "p90": int(_percentile(token_counts, 90)),
+        "p95": int(_percentile(token_counts, 95)),
+        "max_output_tokens": max(token_counts) if token_counts else 0,
+        "possibly_truncated_count": sum(1 for t in token_counts if t >= LIMIT_THRESHOLD),
+        "token_count_method": "exported_output_token_count",
+        "method_warnings": method_warnings,
+        "methods_seen": sorted(methods_seen),
     }
 
 
@@ -183,6 +294,9 @@ def _analyze_model(result_dir, model_label):
     expected_counts = manifest.get("expected_sample_counts", {})
     actual_counts = manifest.get("actual_sample_counts", {})
 
+    # 导出 JSONL 路径（优先使用，token 已是真实 tokenizer 计数）
+    exported_files = manifest.get("exported_generation_files", {}) or {}
+
     task_stats = {}
     total_actual = 0
     total_expected = 0
@@ -190,12 +304,23 @@ def _analyze_model(result_dir, model_label):
     total_duplicate = 0
     total_output_tokens = 0
     all_token_counts = []
+    all_method_warnings = []
+    token_count_methods = set()
 
     for task in tasks:
         tm = task_manifests.get(task, {})
+
+        # 优先使用导出 JSONL；不存在则回退到 lm-eval sample 文件
+        exported_file = exported_files.get(task) or tm.get("exported_generation_file")
         sample_file = tm.get("lm_eval_sample_file") or manifest.get("lm_eval_sample_files", {}).get(task)
 
-        stats = _analyze_sample_file(sample_file, max_gen_toks)
+        if exported_file and os.path.isfile(exported_file):
+            stats = _analyze_exported_file(exported_file, max_gen_toks)
+            token_source = "exported_generation_file"
+        else:
+            stats = _analyze_sample_file(sample_file, max_gen_toks)
+            token_source = "lm_eval_sample_file"
+
         expected = expected_counts.get(task, 0)
         actual = stats["actual_samples"]
 
@@ -212,6 +337,9 @@ def _analyze_model(result_dir, model_label):
             "max_output_tokens": stats["max_output_tokens"],
             "possibly_truncated_count": stats["possibly_truncated_count"],
             "sample_file": sample_file,
+            "exported_file": exported_file,
+            "token_source": token_source,
+            "token_count_method": stats.get("token_count_method", ""),
         }
 
         total_actual += actual
@@ -220,6 +348,9 @@ def _analyze_model(result_dir, model_label):
         total_duplicate += stats["duplicate_count"]
         total_output_tokens += stats["total_output_tokens"]
         all_token_counts.extend(stats["output_token_counts"])
+        all_method_warnings.extend(stats.get("method_warnings", []))
+        if stats.get("token_count_method"):
+            token_count_methods.add(stats["token_count_method"])
 
     # 成功 attempt 耗时
     success_elapsed = manifest.get("successful_attempt_elapsed_seconds", 0)
@@ -263,9 +394,12 @@ def _analyze_model(result_dir, model_label):
         "max_num_seqs": manifest.get("max_num_seqs", 0),
         "gpu_memory_utilization": manifest.get("gpu_memory_utilization", 0),
         "enable_prefix_caching": manifest.get("enable_prefix_caching", False),
+        "enable_chunked_prefill": manifest.get("enable_chunked_prefill", False),
         "dtype": manifest.get("dtype", "bfloat16"),
         "vllm_version": manifest.get("vllm_version", "unknown"),
         "lm_eval_version": manifest.get("lm_eval_version", "unknown"),
+        "output_token_count_methods": sorted(token_count_methods),
+        "output_token_count_warnings": all_method_warnings,
         "task_stats": task_stats,
     }
 
@@ -275,6 +409,7 @@ def _configs_comparable(m1, m2):
     fields = [
         "max_gen_toks", "max_model_len", "max_num_batched_tokens",
         "max_num_seqs", "gpu_memory_utilization", "enable_prefix_caching",
+        "enable_chunked_prefill",
         "dtype",
     ]
     for field in fields:
@@ -333,6 +468,8 @@ def write_comparison(limo_stats, openr1_stats, out_json, out_csv, out_md):
         f.write(f"tokens_per_s,{limo_stats.get('tokens_per_s', 0)},{openr1_stats.get('tokens_per_s', 0)}\n")
         f.write(f"gpu_peak_memory_mib,{limo_stats.get('gpu_peak_memory_mib', 0)},{openr1_stats.get('gpu_peak_memory_mib', 0)}\n")
         f.write(f"fallback_level,{limo_stats.get('fallback_level', 0)},{openr1_stats.get('fallback_level', 0)}\n")
+        f.write(f"enable_prefix_caching,{limo_stats.get('enable_prefix_caching', False)},{openr1_stats.get('enable_prefix_caching', False)}\n")
+        f.write(f"enable_chunked_prefill,{limo_stats.get('enable_chunked_prefill', False)},{openr1_stats.get('enable_chunked_prefill', False)}\n")
         f.write(f"config_comparable,{config_match},{config_match}\n")
         f.write(f"throughput_comparable,{comparison['throughput_comparable']},{comparison['throughput_comparable']}\n")
     os.replace(tmp, out_csv)
@@ -372,6 +509,7 @@ def write_comparison(limo_stats, openr1_stats, out_json, out_csv, out_md):
         f.write(f"| max_num_seqs | {limo_stats.get('max_num_seqs')} | {openr1_stats.get('max_num_seqs')} |\n")
         f.write(f"| gpu_memory_utilization | {limo_stats.get('gpu_memory_utilization')} | {openr1_stats.get('gpu_memory_utilization')} |\n")
         f.write(f"| enable_prefix_caching | {limo_stats.get('enable_prefix_caching')} | {openr1_stats.get('enable_prefix_caching')} |\n")
+        f.write(f"| enable_chunked_prefill | {limo_stats.get('enable_chunked_prefill')} | {openr1_stats.get('enable_chunked_prefill')} |\n")
         f.write(f"| dtype | {limo_stats.get('dtype')} | {openr1_stats.get('dtype')} |\n")
         f.write(f"| vLLM version | {limo_stats.get('vllm_version')} | {openr1_stats.get('vllm_version')} |\n")
         f.write(f"| lm-eval version | {limo_stats.get('lm_eval_version')} | {openr1_stats.get('lm_eval_version')} |\n")

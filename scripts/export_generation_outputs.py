@@ -11,19 +11,26 @@ arguments/doc 等），本脚本将其展平为后续本地判分可直接使用
   - task / benchmark / doc_id / sample_id
   - question / gold_answer / gold_solution
   - prompt / raw_output / filtered_output
-  - prompt_token_count / output_token_count
+  - prompt_token_count / output_token_count / output_token_count_method
   - max_gen_toks / max_model_len / temperature / do_sample
   - tensor_parallel_size / max_num_batched_tokens / max_num_seqs
-  - gpu_memory_utilization / enable_prefix_caching
-  - dataset_path / dataset_split / dataset_fingerprint
+  - gpu_memory_utilization / enable_prefix_caching / enable_chunked_prefill
+  - dataset_path / dataset_split
   - prompt_hash / output_hash
   - run_id / git_commit / created_at
 
+关键修复:
+  1. _extract_prompt() 兼容 lm-eval 0.4.5 dict 格式 (gen_args_0.arg_0)
+  2. 使用真实 Llama tokenizer 计算 token 数 (不用空格近似)
+  3. 空输出直接 raise ValueError (不静默记录)
+  4. 导出后调用 validate_generation_task.validate_exported_generation_file 严格校验
+  5. 原子写入 (tmp + os.replace)
+
 用法:
-    python scripts/export_generation_outputs.py \
-        --task_manifest runs/<run_id>/tasks/<task>/task_manifest.json \
-        --model_name "LIMO-817" \
-        --model_path outputs/llama31_8b_limo_817_merged \
+    python scripts/export_generation_outputs.py \\
+        --task_manifest runs/<run_id>/tasks/<task>/task_manifest.json \\
+        --model_name "LIMO-817" \\
+        --model_path outputs/llama31_8b_limo_817_merged \\
         --out results/generated_outputs/limo_math500.jsonl
 """
 import argparse
@@ -34,6 +41,15 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+# 从同目录导入验证模块
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from validate_generation_task import (
+    extract_output,
+    extract_prompt,
+    extract_doc_id,
+    validate_exported_generation_file,
+)
 
 
 # ---------- 数据集配置 ----------
@@ -80,65 +96,32 @@ def _get_git_commit() -> str:
         return "unknown"
 
 
-def _count_tokens_approx(text: str) -> int:
-    """粗略估算 token 数（按空格+标点分词）。
-    准确计数需要 tokenizer，但导出时不依赖 transformers。"""
+def _load_tokenizer(model_path: str):
+    """加载 Llama tokenizer 用于真实 token 计数。
+
+    一个导出进程只加载一次 tokenizer。
+    如果加载失败，导出必须返回非零，不允许静默回退为空格估算。
+    """
+    try:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            use_fast=True,
+        )
+        return tokenizer
+    except Exception as e:
+        raise RuntimeError(
+            f"无法加载 tokenizer (model_path={model_path}): {e}。"
+            f"导出需要真实 tokenizer 计算 token 数，不允许空格近似。"
+        )
+
+
+def _count_tokens(tokenizer, text: str) -> int:
+    """使用真实 tokenizer 计算 token 数。"""
     if not text:
         return 0
-    # 简单估算：英文按空格分词，中文字符单独计数
-    import re
-    # 英文单词
-    en_tokens = len(re.findall(r"\S+", text))
-    return en_tokens
-
-
-def _extract_resps(sample_obj: dict) -> tuple:
-    """从 lm-eval sample 对象提取 (raw_output, filtered_output)。
-    lm-eval 的 resps 格式: [["text"], ["text"], ...] 或 [["text"]]
-    filtered_resps 格式类似。"""
-    raw_output = ""
-    filtered_output = ""
-
-    resps = sample_obj.get("resps")
-    if resps is not None:
-        if isinstance(resps, list) and len(resps) > 0:
-            first = resps[0]
-            if isinstance(first, list) and len(first) > 0:
-                raw_output = str(first[0])
-            elif isinstance(first, str):
-                raw_output = first
-
-    filtered_resps = sample_obj.get("filtered_resps")
-    if filtered_resps is not None:
-        if isinstance(filtered_resps, list) and len(filtered_resps) > 0:
-            first = filtered_resps[0]
-            if isinstance(first, list) and len(first) > 0:
-                filtered_output = str(first[0])
-            elif isinstance(first, str):
-                filtered_output = first
-    else:
-        filtered_output = raw_output
-
-    return raw_output, filtered_output
-
-
-def _extract_prompt(sample_obj: dict) -> str:
-    """从 lm-eval sample 对象提取 prompt。
-    lm-eval 的 arguments 格式: [["prompt_text"], ["stop1", "stop2"]]"""
-    # 优先用 arguments
-    arguments = sample_obj.get("arguments")
-    if arguments is not None:
-        if isinstance(arguments, list) and len(arguments) > 0:
-            first = arguments[0]
-            if isinstance(first, list) and len(first) > 0:
-                return str(first[0])
-            elif isinstance(first, str):
-                return first
-    # 回退到 prompt 字段
-    prompt = sample_obj.get("prompt")
-    if prompt is not None:
-        return str(prompt)
-    return ""
+    return len(tokenizer.encode(text, add_special_tokens=False))
 
 
 def _extract_doc(sample_obj: dict) -> dict:
@@ -147,16 +130,6 @@ def _extract_doc(sample_obj: dict) -> dict:
     if doc is not None and isinstance(doc, dict):
         return doc
     return {}
-
-
-def _extract_doc_id(sample_obj: dict, line_num: int) -> any:
-    """提取 doc_id。"""
-    did = sample_obj.get("doc_id")
-    if did is None:
-        did = sample_obj.get("id")
-    if did is None:
-        did = line_num
-    return did
 
 
 def load_task_manifest(manifest_path: str) -> dict:
@@ -170,9 +143,23 @@ def export_single_task(
     model_name: str,
     model_path: str,
     out_path: str,
+    tokenizer=None,
 ) -> dict:
     """导出单个 task 的统一 JSONL。
-    返回导出统计信息。"""
+
+    参数:
+        task_manifest: task manifest dict
+        model_name: 模型名称
+        model_path: 模型路径
+        out_path: 输出 JSONL 路径
+        tokenizer: 已加载的 tokenizer（如果为 None 则内部加载）
+
+    返回导出统计信息。
+
+    异常:
+        ValueError: 空输出、重复 sample_id、JSON 解析失败等
+        RuntimeError: tokenizer 加载失败
+    """
     task = task_manifest.get("task", "unknown")
     ds_config = DATASET_CONFIGS.get(task, {
         "dataset_path": "unknown",
@@ -197,16 +184,23 @@ def export_single_task(
     max_num_seqs = task_manifest.get("max_num_seqs", 0)
     gpu_memory_utilization = task_manifest.get("gpu_memory_utilization", 0.0)
     enable_prefix_caching = task_manifest.get("enable_prefix_caching", False)
+    enable_chunked_prefill = task_manifest.get("enable_chunked_prefill", True)
     run_id = task_manifest.get("run_id", "unknown")
     base_model = task_manifest.get("base_model", "meta-llama/Llama-3.1-8B")
 
     git_commit = _get_git_commit()
     created_at = datetime.now(timezone.utc).isoformat()
 
+    # 加载 tokenizer（如果外部未传入）
+    if tokenizer is None:
+        tokenizer = _load_tokenizer(model_path)
+
     # 读取 sample JSONL 并导出
     records = []
     seen_sample_ids = set()
     empty_output_count = 0
+    empty_prompt_count = 0
+    empty_question_count = 0
 
     with open(sample_file, encoding="utf-8") as f:
         for line_num, line in enumerate(f, 1):
@@ -218,7 +212,7 @@ def export_single_task(
             except json.JSONDecodeError as e:
                 raise ValueError(f"第 {line_num} 行 JSON 解析失败: {e}")
 
-            doc_id = _extract_doc_id(sample_obj, line_num)
+            doc_id = extract_doc_id(sample_obj, line_num)
             sample_id = f"{task}:{doc_id}"
             if sample_id in seen_sample_ids:
                 raise ValueError(f"重复 sample_id: {sample_id}")
@@ -226,21 +220,53 @@ def export_single_task(
 
             doc = _extract_doc(sample_obj)
             question = str(doc.get(ds_config["question_field"], ""))
-            gold_answer = str(doc.get(ds_config["answer_field"], ""))
+            # gold_answer 允许值是 0，不能用 if not 判断
+            gold_answer = doc.get(ds_config["answer_field"])
+            if gold_answer is not None:
+                gold_answer = str(gold_answer)
             gold_solution = doc.get(ds_config["solution_field"])
             if gold_solution is not None:
                 gold_solution = str(gold_solution)
 
-            prompt = _extract_prompt(sample_obj)
-            raw_output, filtered_output = _extract_resps(sample_obj)
+            prompt = extract_prompt(sample_obj)
+            raw_output = extract_output(sample_obj)
 
+            # filtered_output: 如果有 filtered_resps 则用之，否则等于 raw_output
+            filtered_resps = sample_obj.get("filtered_resps")
+            filtered_output = raw_output
+            if filtered_resps is not None:
+                filtered_output = extract_output(
+                    {"resps": filtered_resps}
+                )
+                if not filtered_output:
+                    filtered_output = raw_output
+
+            # 空输出检查 - 必须报错
             if not raw_output.strip():
                 empty_output_count += 1
+                raise ValueError(
+                    f"sample_id={sample_id} 的 raw_output 为空"
+                )
 
-            prompt_token_count = _count_tokens_approx(prompt)
-            output_token_count = _count_tokens_approx(raw_output)
+            # 空 prompt 检查 - 必须报错
+            if not prompt.strip():
+                empty_prompt_count += 1
+                raise ValueError(
+                    f"sample_id={sample_id} 的 prompt 为空"
+                )
 
-            # 判断是否可能截断
+            # 空 question 检查
+            if not question.strip():
+                empty_question_count += 1
+                raise ValueError(
+                    f"sample_id={sample_id} 的 question 为空"
+                )
+
+            # 使用真实 tokenizer 计算 token 数
+            prompt_token_count = _count_tokens(tokenizer, prompt)
+            output_token_count = _count_tokens(tokenizer, raw_output)
+
+            # 判断是否可能截断（基于真实 token 数）
             possibly_truncated = output_token_count >= (max_gen_toks - 8)
 
             record = {
@@ -259,6 +285,7 @@ def export_single_task(
                 "filtered_output": filtered_output,
                 "prompt_token_count": prompt_token_count,
                 "output_token_count": output_token_count,
+                "output_token_count_method": "llama_tokenizer",
                 "max_gen_toks": max_gen_toks,
                 "max_model_len": max_model_len,
                 "possibly_truncated": possibly_truncated,
@@ -269,6 +296,7 @@ def export_single_task(
                 "max_num_seqs": max_num_seqs,
                 "gpu_memory_utilization": gpu_memory_utilization,
                 "enable_prefix_caching": enable_prefix_caching,
+                "enable_chunked_prefill": enable_chunked_prefill,
                 "dataset_path": ds_config["dataset_path"],
                 "dataset_split": ds_config["dataset_split"],
                 "prompt_hash": _hash(prompt),
@@ -279,6 +307,9 @@ def export_single_task(
             }
             records.append(record)
 
+    if not records:
+        raise ValueError(f"task={task} 未导出任何记录（sample 文件为空或无有效行）")
+
     # 原子写入
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     tmp_path = out_path + ".tmp"
@@ -286,33 +317,27 @@ def export_single_task(
         for record in records:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    # 验证写入的文件
+    # 验证写入的文件（使用生产代码验证）
+    expected_count = len(records)
+    verify_errors = validate_exported_generation_file(
+        tmp_path, expected_count=expected_count, max_gen_toks=max_gen_toks
+    )
+    if verify_errors:
+        os.unlink(tmp_path)
+        raise ValueError(
+            f"导出文件验证失败: {verify_errors}"
+        )
+
     verify_count = 0
-    verify_ids = set()
     with open(tmp_path, encoding="utf-8") as f:
         for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError as e:
-                os.unlink(tmp_path)
-                raise ValueError(f"验证失败: JSON 解析错误: {e}")
-            sid = obj.get("sample_id")
-            if sid in verify_ids:
-                os.unlink(tmp_path)
-                raise ValueError(f"验证失败: 重复 sample_id: {sid}")
-            verify_ids.add(sid)
-            raw = obj.get("raw_output", "")
-            if not raw.strip():
-                # 空输出记录但不报错（manifest 中已记录）
-                pass
-            verify_count += 1
-
-    if verify_count != len(records):
+            if line.strip():
+                verify_count += 1
+    if verify_count != expected_count:
         os.unlink(tmp_path)
-        raise ValueError(f"验证失败: 写入 {len(records)} 条但读回 {verify_count} 条")
+        raise ValueError(
+            f"验证失败: 写入 {expected_count} 条但读回 {verify_count} 条"
+        )
 
     os.replace(tmp_path, out_path)
 
@@ -322,7 +347,11 @@ def export_single_task(
         "benchmark": ds_config["benchmark"],
         "total_records": len(records),
         "empty_output_count": empty_output_count,
-        "unique_sample_ids": len(verify_ids),
+        "empty_prompt_count": empty_prompt_count,
+        "empty_question_count": empty_question_count,
+        "duplicate_count": 0,
+        "unique_sample_ids": len(seen_sample_ids),
+        "token_count_method": "llama_tokenizer",
     }
 
 
@@ -335,7 +364,7 @@ def main():
     parser.add_argument("--model_name", required=True,
                         help="模型名称（如 LIMO-817）")
     parser.add_argument("--model_path", required=True,
-                        help="模型路径")
+                        help="模型路径（用于加载 tokenizer）")
     parser.add_argument("--out", required=True,
                         help="输出 JSONL 路径")
     args = parser.parse_args()
@@ -351,11 +380,17 @@ def main():
         print(f"[WARN] task manifest status={task_manifest.get('status')}，"
               f"仍尝试导出已有输出。", file=sys.stderr)
 
+    # 加载 tokenizer（只加载一次）
+    print(f"[export] 加载 tokenizer: {args.model_path}")
+    tokenizer = _load_tokenizer(args.model_path)
+    print(f"[export] tokenizer 加载成功")
+
     result = export_single_task(
         task_manifest=task_manifest,
         model_name=args.model_name,
         model_path=args.model_path,
         out_path=args.out,
+        tokenizer=tokenizer,
     )
 
     print(f"[export] DONE")
@@ -363,7 +398,10 @@ def main():
     print(f"  benchmark       = {result['benchmark']}")
     print(f"  total_records   = {result['total_records']}")
     print(f"  empty_outputs   = {result['empty_output_count']}")
+    print(f"  empty_prompts   = {result['empty_prompt_count']}")
+    print(f"  empty_questions = {result['empty_question_count']}")
     print(f"  unique_ids      = {result['unique_sample_ids']}")
+    print(f"  token_method    = {result['token_count_method']}")
     print(f"  out_path        = {result['out_path']}")
 
 

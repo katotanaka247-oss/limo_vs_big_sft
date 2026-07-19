@@ -397,9 +397,10 @@ if [[ -f "$EFF_PY" ]]; then
     fi
 fi
 
-# 8. 最终 GPU 空闲确认
+# 8. 最终 GPU 空闲确认（失败必须返回非零）
 assert_gpu_free "final" 30 || {
-    log "[WARN] 最终 GPU 检查未通过，可能有残留进程。" >&2
+    log "[ERROR] 最终 GPU 检查未通过，有残留进程。" >&2
+    exit 1
 }
 
 log "================ 两模型串行评测完成 (generation-only) ================"

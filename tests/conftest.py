@@ -58,6 +58,7 @@ def make_mock_run_manifest():
             "max_num_seqs": mns,
             "gpu_memory_utilization": gmu,
             "enable_prefix_caching": epc,
+            "enable_chunked_prefill": True,
             "fallback_level": fallback_level,
             "tensor_parallel_size": 1,
             "cuda_visible_devices": "0",
@@ -88,6 +89,7 @@ def make_mock_run_manifest():
             "task_manifests": {t: f"tasks/{t}/task_manifest.json" for t in tasks},
             "lm_eval_results_file": str(path.parent / "results.json"),
             "lm_eval_sample_files": sample_files,
+            "exported_generation_files": {t: str(path.parent / "tasks" / t / "exported.jsonl") for t in tasks},
             "completion_errors": [],
         }
         manifest.update(overrides)
@@ -159,7 +161,7 @@ def make_mock_task_manifest():
 
 @pytest.fixture
 def make_mock_sample_jsonl():
-    """生成 mock sample JSONL 文件（generation-only 格式）。"""
+    """生成 mock sample JSONL 文件（generation-only 格式，lm-eval 0.4.5 dict 格式）。"""
     def _make(path, n=2, token_counts=None, with_dup=False,
               empty_output=False, with_resps=True):
         rows = []
@@ -171,10 +173,16 @@ def make_mock_sample_jsonl():
                 resps = None
             if empty_output and i == 0:
                 resps = [[""]]
+            # lm-eval 0.4.5 保存后的 dict 格式
             row = {
                 "doc_id": i,
                 "doc": {"problem": f"Problem {i}", "answer": str(i)},
-                "arguments": [[f"Problem: Problem {i}\nAnswer:"]],
+                "arguments": {
+                    "gen_args_0": {
+                        "arg_0": f"Problem: Problem {i}\nAnswer:",
+                        "arg_1": {"max_gen_toks": 32768}
+                    }
+                },
                 "resps": resps,
                 "filtered_resps": resps,
             }
@@ -183,7 +191,12 @@ def make_mock_sample_jsonl():
             rows.append({
                 "doc_id": 0,
                 "doc": {"problem": "Problem 0", "answer": "0"},
-                "arguments": [["Problem: Problem 0\nAnswer:"]],
+                "arguments": {
+                    "gen_args_0": {
+                        "arg_0": "Problem: Problem 0\nAnswer:",
+                        "arg_1": {"max_gen_toks": 32768}
+                    }
+                },
                 "resps": [["duplicate"]],
                 "filtered_resps": [["duplicate"]],
             })
@@ -255,7 +268,12 @@ def make_full_run_structure(tmp_path):
                     f.write(json.dumps({
                         "doc_id": i,
                         "doc": {"problem": f"Problem {i}", "answer": str(i)},
-                        "arguments": [[f"Problem: Problem {i}\nAnswer:"]],
+                        "arguments": {
+                            "gen_args_0": {
+                                "arg_0": f"Problem: Problem {i}\nAnswer:",
+                                "arg_1": {"max_gen_toks": 32768}
+                            }
+                        },
                         "resps": [[f"answer {i}"]],
                         "filtered_resps": [[f"answer {i}"]],
                     }) + "\n")
@@ -276,6 +294,7 @@ def make_full_run_structure(tmp_path):
                 "max_num_seqs": mns,
                 "gpu_memory_utilization": gmu,
                 "enable_prefix_caching": epc,
+                "enable_chunked_prefill": True,
                 "fallback_level": fallback_level,
                 "successful_attempt_elapsed_seconds": success_elapsed,
                 "expected_sample_count": expected.get(task, n_samples),
@@ -303,6 +322,7 @@ def make_full_run_structure(tmp_path):
             "max_num_seqs": mns,
             "gpu_memory_utilization": gmu,
             "enable_prefix_caching": epc,
+            "enable_chunked_prefill": True,
             "fallback_level": fallback_level,
             "gpu_peak_memory_mib": gpu_peak,
             "vllm_version": "0.6.6.post1",
@@ -314,6 +334,7 @@ def make_full_run_structure(tmp_path):
             "expected_sample_counts": expected,
             "actual_sample_counts": actual,
             "lm_eval_sample_files": sample_files,
+            "exported_generation_files": {},
         }
         with open(run_dir / "run_manifest.json", "w") as f:
             json.dump(rm, f)

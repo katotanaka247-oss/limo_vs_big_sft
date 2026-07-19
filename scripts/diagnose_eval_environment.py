@@ -240,12 +240,14 @@ def check_local_tasks(checks):
                 continue
         if not found:
             _fail(checks, name, {"error": f"task '{task}' not found in eval_tasks/"})
-    # 检查 math_utils.py
+    # 检查 math_utils.py（generation-only 模式不依赖 math_verify，缺失只 warn）
     mu = EVAL_TASKS_DIR / "math_utils.py"
     if mu.is_file():
         _ok(checks, "math_utils", {"path": str(mu)})
     else:
-        _fail(checks, "math_utils", {"error": "eval_tasks/math_utils.py 缺失"})
+        _warn(checks, "math_utils", {
+            "error": "eval_tasks/math_utils.py 缺失（generation-only 模式非阻塞）",
+        })
 
 
 def check_hf_datasets(checks):
@@ -373,6 +375,112 @@ def check_pip_conflicts(checks):
         _warn(checks, "pip_check", {"error": str(e)})
 
 
+def check_chunked_prefill_config(checks):
+    """静态检查 run_eval_single_l40_vllm.sh 中的 vLLM 调度关键参数。
+
+    检查项:
+      * enable_chunked_prefill=True 出现在 model_args 中
+      * MAX_MODEL_LEN >= 32768
+      * MAX_GEN_TOKS == 32768
+      * tensor_parallel_size=1 出现在 model_args 中
+    任一检查失败均使用 _fail()。
+    """
+    import re
+
+    sh_path = PROJECT_DIR / "scripts" / "run_eval_single_l40_vllm.sh"
+    name = "chunked_prefill_config"
+    if not sh_path.is_file():
+        _fail(checks, name, {"error": f"{sh_path} 不存在"})
+        return
+
+    content = sh_path.read_text(encoding="utf-8")
+    errors = []
+
+    # 1. 检查 enable_chunked_prefill=True
+    if "enable_chunked_prefill=True" not in content:
+        errors.append("enable_chunked_prefill=True 未在 model_args 中找到")
+
+    # 2. 检查 MAX_MODEL_LEN >= 32768
+    max_model_len = None
+    # 匹配 MAX_MODEL_LEN="${MAX_MODEL_LEN:-NUMBER}" 形式（带默认值）
+    m = re.search(r'MAX_MODEL_LEN="\$\{MAX_MODEL_LEN:-(\d+)\}"', content)
+    if m:
+        max_model_len = int(m.group(1))
+    else:
+        # 匹配直接赋值 MAX_MODEL_LEN=NUMBER
+        m = re.search(r'^\s*MAX_MODEL_LEN=(\d+)', content, re.MULTILINE)
+        if m:
+            max_model_len = int(m.group(1))
+    if max_model_len is None:
+        errors.append("无法从脚本中解析 MAX_MODEL_LEN")
+    elif max_model_len < 32768:
+        errors.append(f"MAX_MODEL_LEN={max_model_len} < 32768")
+
+    # 3. 检查 MAX_GEN_TOKS == 32768
+    max_gen_toks = None
+    m = re.search(r'^\s*MAX_GEN_TOKS=(\d+)', content, re.MULTILINE)
+    if m:
+        max_gen_toks = int(m.group(1))
+    if max_gen_toks is None:
+        errors.append("无法从脚本中解析 MAX_GEN_TOKS")
+    elif max_gen_toks != 32768:
+        errors.append(f"MAX_GEN_TOKS={max_gen_toks} != 32768")
+
+    # 4. 检查 tensor_parallel_size=1
+    if "tensor_parallel_size=1" not in content:
+        errors.append("tensor_parallel_size=1 未在 model_args 中找到")
+
+    if errors:
+        _fail(checks, name, {
+            "script": str(sh_path),
+            "errors": errors,
+            "max_model_len": max_model_len,
+            "max_gen_toks": max_gen_toks,
+        })
+    else:
+        _ok(checks, name, {
+            "script": str(sh_path),
+            "max_model_len": max_model_len,
+            "max_gen_toks": max_gen_toks,
+            "enable_chunked_prefill": True,
+            "tensor_parallel_size": 1,
+        })
+
+
+def check_vllm_scheduler_config(checks):
+    """构造 vllm.config.SchedulerConfig 验证参数兼容性。
+
+    使用与 run_eval_single_l40_vllm.sh level-1 fallback 一致的参数构造
+    SchedulerConfig，验证 max_num_batched_tokens / max_num_seqs /
+    max_model_len / enable_chunked_prefill 之间不存在约束冲突。
+    """
+    name = "vllm_scheduler_config"
+    params = {
+        "max_num_batched_tokens": 8192,
+        "max_num_seqs": 32,
+        "max_model_len": 40960,
+        "enable_chunked_prefill": True,
+    }
+    try:
+        from vllm.config import SchedulerConfig
+    except ImportError:
+        _warn(checks, name, {"error": "vllm 未安装，无法验证 SchedulerConfig"})
+        return
+    try:
+        SchedulerConfig(
+            max_num_batched_tokens=params["max_num_batched_tokens"],
+            max_num_seqs=params["max_num_seqs"],
+            max_model_len=params["max_model_len"],
+            enable_chunked_prefill=params["enable_chunked_prefill"],
+        )
+        _ok(checks, name, params)
+    except Exception as e:
+        _fail(checks, name, {
+            "error": str(e),
+            "params": params,
+        })
+
+
 def main():
     checks = []
 
@@ -387,6 +495,8 @@ def main():
     check_cpu_memory(checks)
     check_gpu_free(checks)
     check_pip_conflicts(checks)
+    check_chunked_prefill_config(checks)
+    check_vllm_scheduler_config(checks)
 
     # 汇总
     n_ok = sum(1 for c in checks if c["status"] == "ok")

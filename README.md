@@ -293,20 +293,28 @@ trust_remote_code=True
 - `max_num_seqs` 通过 vLLM model_args `**kwargs` 传递（lm-eval 0.4.5 VLLM backend 支持）。
 - OOM fallback 4 次尝试（`max_gen_toks` 始终 32768，`max_model_len` 始终不变，task/prompt 不变）：
 
-| level | max_num_batched_tokens | max_num_seqs | gpu_mem_util | prefix_cache |
-|-------|----------------------:|-------------:|-------------:|:------------:|
-| 1     | 8192                  | 32           | 0.90         | True         |
-| 2     | 4096                  | 16           | 0.90         | True         |
-| 3     | 2048                  | 8            | 0.88         | True         |
-| 4     | 2048                  | 4            | 0.88         | False        |
+| level | max_num_batched_tokens | max_num_seqs | gpu_mem_util | prefix_cache | chunked_prefill |
+|-------|----------------------:|-------------:|-------------:|:------------:|:---------------:|
+| 1     | 8192                  | 32           | 0.90         | True         | True            |
+| 2     | 4096                  | 16           | 0.90         | True         | True            |
+| 3     | 2048                  | 8            | 0.88         | True         | True            |
+| 4     | 2048                  | 4            | 0.88         | False        | True            |
 
+- `enable_chunked_prefill=True` 显式设置在 model_args 中，不依赖 vLLM 隐式默认。
+- OOM 正则缩小为 `CUDA out of memory` / `torch.cuda.OutOfMemoryError` / `HBM out of memory` /
+  `CUDA error: out of memory`，不匹配笼统的 `CUDA error`（避免 `invalid argument` 等非 OOM 错误触发 fallback）。
 - manifest 记录 `fallback_level` 字段，两模型公平性比较使用**数值比较**（非字符串比较），
   `0.90` 与 `0.9` 视为相等。
 - 非 OOM 错误立即停止，不盲目 fallback。
 - 每个 task 独立调用 lm-eval（task 级断点恢复），每次 attempt 使用独立输出目录
   `attempts/attempt_N/lm_eval_output/`，等待前一个 vLLM 进程完全退出并验证 GPU 显存释放后才启动下一次。
+- task 成功后 GPU 清理**必须返回错误**（不能只 warning），防止残留进程影响下一 task。
 - 每个 attempt 独立计时，效率统计使用 `successful_attempt_elapsed_seconds`（不含失败 attempt、
   等待显存释放、fallback、模型重新加载时间），不使用整个 pipeline 耗时计算 tokens/s。
+- **导出失败阻断 task 完成**：统一 JSONL 导出失败时 task_manifest 标记为 incomplete，返回非零，
+  不允许只 warning。task 完成条件包括 `export_status=complete`。
+- **真实 tokenizer token 计数**：导出时加载 Llama tokenizer，`output_token_count` 使用真实 tokenizer
+  计算，`output_token_count_method=llama_tokenizer`，不用空格近似。
 
 ### 5. Smoke Test（每 benchmark 2 条样本）
 

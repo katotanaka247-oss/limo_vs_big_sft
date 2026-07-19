@@ -543,6 +543,82 @@ class TestGenerationOnly:
                 assert "math_verify" not in stripped, \
                     "requirements-eval-vllm-cu121.txt 不应依赖 math_verify"
 
+    def test_enable_chunked_prefill_in_model_args(self):
+        """P1: model_args 中必须显式包含 enable_chunked_prefill=True"""
+        script_path = SCRIPTS_DIR / "run_eval_single_l40_vllm.sh"
+        if not script_path.is_file():
+            pytest.skip("script not found")
+        content = script_path.read_text(encoding="utf-8")
+        assert "enable_chunked_prefill=True" in content, \
+            "脚本中未显式设置 enable_chunked_prefill=True"
+
+    def test_enable_chunked_prefill_in_manifest(self):
+        """P1: manifest 中必须记录 enable_chunked_prefill"""
+        script_path = SCRIPTS_DIR / "run_eval_single_l40_vllm.sh"
+        if not script_path.is_file():
+            pytest.skip("script not found")
+        content = script_path.read_text(encoding="utf-8")
+        assert '"enable_chunked_prefill"' in content, \
+            "脚本中未在 manifest 中记录 enable_chunked_prefill"
+
+    def test_oom_regex_narrow(self):
+        """P1: OOM 正则不应匹配笼统的 'CUDA error'"""
+        script_path = SCRIPTS_DIR / "run_eval_single_l40_vllm.sh"
+        if not script_path.is_file():
+            pytest.skip("script not found")
+        content = script_path.read_text(encoding="utf-8")
+        # 找到 OOM 检测的 grep 命令
+        # 不应单独匹配 "CUDA error"（会匹配 "CUDA error: invalid argument" 等非 OOM 错误）
+        # 应该匹配 "CUDA error: out of memory" 或 "CUDA out of memory"
+        assert "CUDA out of memory" in content or \
+               "CUDA error: out of memory" in content, \
+            "OOM 正则应包含 'CUDA out of memory' 或 'CUDA error: out of memory'"
+
+    def test_export_failure_blocks_completion(self):
+        """P0: 导出失败必须返回非零（不能只 warning）"""
+        script_path = SCRIPTS_DIR / "run_eval_single_l40_vllm.sh"
+        if not script_path.is_file():
+            pytest.skip("script not found")
+        content = script_path.read_text(encoding="utf-8")
+        # 不应出现 "不影响评测完整性" 这样的 warning
+        assert "不影响评测完整性" not in content, \
+            "导出失败不应只 warning，应阻断 task 完成"
+
+    def test_gpu_cleanup_strict_after_task(self):
+        """P1: task 成功后 GPU 清理必须返回错误（不能只 warning）"""
+        script_path = SCRIPTS_DIR / "run_eval_single_l40_vllm.sh"
+        if not script_path.is_file():
+            pytest.skip("script not found")
+        content = script_path.read_text(encoding="utf-8")
+        # 找到 task 成功后的 GPU 清理
+        idx = content.find("task=$task success cleanup")
+        if idx < 0:
+            pytest.skip("未找到 task success cleanup")
+        nearby = content[max(0, idx-200):idx+200]
+        # 不应只 warning，应该 return 7 或类似错误
+        assert "return 7" in nearby or "return 1" in nearby, \
+            "task 成功后 GPU 未释放应返回错误，不能只 warning"
+
+    def test_validate_generation_task_module_exists(self):
+        """P1: validate_generation_task.py 必须存在"""
+        vgt_path = SCRIPTS_DIR / "validate_generation_task.py"
+        assert vgt_path.is_file(), \
+            "scripts/validate_generation_task.py 不存在"
+
+    def test_assert_gpu_free_fails_in_two_models(self):
+        """P1: two_models 脚本中 assert_gpu_free 最终检查失败必须 exit 1"""
+        script_path = SCRIPTS_DIR / "run_eval_two_models_single_l40.sh"
+        if not script_path.is_file():
+            pytest.skip("script not found")
+        content = script_path.read_text(encoding="utf-8")
+        # 找到 "最终 GPU" 附近的代码
+        idx = content.find("final")
+        if idx < 0:
+            pytest.skip("未找到 final GPU check")
+        nearby = content[max(0, idx-200):idx+400]
+        assert "exit 1" in nearby, \
+            "assert_gpu_free 最终检查失败应 exit 1"
+
 
 class TestGPUMemoryParsing:
     """GPU 显存解析测试"""

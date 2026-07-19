@@ -97,11 +97,8 @@ RUN_ID="run_$(date +%Y%m%d_%H%M%S)"
 RUN_DIR="$OUTPUT_DIR/runs/$RUN_ID"
 ACTIVE_RUN_JSON="$OUTPUT_DIR/active_run.json"
 
-mkdir -p "$RUN_DIR"
-RUNTIME_LOG="$RUN_DIR/runtime.log"
-MANIFEST="$RUN_DIR/run_manifest.json"
-GPU_LOG="$RUN_DIR/nvidia_smi.log"
-PROMPT_CHECK_JSON="$RUN_DIR/prompt_length_check.json"
+# 临时日志（active_run 检查可能改变 RUN_DIR）
+RUNTIME_LOG="$OUTPUT_DIR/runtime_start.log"
 
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$RUNTIME_LOG"; }
 
@@ -152,6 +149,25 @@ PY
             log "[skip] 已有完整结果 ($ACTIVE_RUN_ID)，跳过。FORCE_RERUN=1 可强制重跑。"
             exit 0
         fi
+    elif [[ "$ACTIVE_STATUS" == "running" ]]; then
+        if [[ "$FORCE_RERUN" == "1" ]]; then
+            log "[skip-check] 上一次 run ($ACTIVE_RUN_ID) 状态=running，FORCE_RERUN=1，新建 run 重跑。"
+        else
+            # 跨进程 task 级恢复：复用已有 RUN_DIR
+            log "[resume] 检测到未完成 run ($ACTIVE_RUN_ID)，尝试 task 级恢复。"
+            RESUME_RUN_DIR="$OUTPUT_DIR/runs/$ACTIVE_RUN_ID"
+            if [[ -d "$RESUME_RUN_DIR" ]]; then
+                RUN_ID="$ACTIVE_RUN_ID"
+                RUN_DIR="$RESUME_RUN_DIR"
+                log "[resume] 复用 RUN_DIR=$RUN_DIR"
+                # 逐 task 验证已完成输出（在 run_task 中检查 task_manifest）
+                RESUME_MODE=1
+            else
+                log "[ERROR] active_run.json 指向 run=$ACTIVE_RUN_ID 但目录不存在。" >&2
+                log "  请设置 FORCE_RERUN=1 新建 run。" >&2
+                exit 3
+            fi
+        fi
     elif [[ -n "$ACTIVE_STATUS" ]]; then
         if [[ "$FORCE_RERUN" == "1" ]]; then
             log "[skip-check] 上一次 run ($ACTIVE_RUN_ID) 状态=$ACTIVE_STATUS，FORCE_RERUN=1，新建 run 重跑。"
@@ -163,6 +179,38 @@ PY
         fi
     fi
 fi
+
+# 初始化 RESUME_MODE（如果未设置）
+RESUME_MODE="${RESUME_MODE:-0}"
+
+# 创建/复用 RUN_DIR，设置正式日志路径
+mkdir -p "$RUN_DIR"
+if [[ "$RESUME_MODE" == "1" ]]; then
+    # 恢复模式：追加到已有日志
+    RUNTIME_LOG="$RUN_DIR/runtime.log"
+    log "[resume] 恢复模式，追加到已有日志: $RUNTIME_LOG"
+else
+    # 新 run：移动临时日志到 RUN_DIR
+    RUNTIME_LOG="$RUN_DIR/runtime.log"
+    if [[ -f "$OUTPUT_DIR/runtime_start.log" ]]; then
+        mv "$OUTPUT_DIR/runtime_start.log" "$RUNTIME_LOG" 2>/dev/null || true
+    fi
+fi
+MANIFEST="$RUN_DIR/run_manifest.json"
+GPU_LOG="$RUN_DIR/nvidia_smi.log"
+PROMPT_CHECK_JSON="$RUN_DIR/prompt_length_check.json"
+
+# 写 active_run status=running（让其他进程知道本次 run 正在进行）
+python - "$ACTIVE_RUN_JSON" "$RUN_ID" "$RUN_NAME" <<'PY'
+import json, os, sys
+path, run_id, model_name = sys.argv[1], sys.argv[2], sys.argv[3]
+data = {"active_run_id": run_id, "status": "running", "model_name": model_name}
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+os.replace(tmp, path)
+PY
+log "[active_run] 写入 status=running, run_id=$RUN_ID"
 
 # ---------- 2. 查询目标 GPU 信息 ----------
 log "查询目标 GPU (index=$GPU_INDEX) 信息 ..."
@@ -387,20 +435,115 @@ run_task() {
     log "  task_dir = $task_dir"
 
     # 如果 FORCE_RERUN 未设置，检查 task 是否已完成（断点恢复）
+    # 恢复时必须重新验证，不只信 task_manifest.status
     if [[ "$FORCE_RERUN" != "1" && -f "$task_manifest" ]]; then
-        local task_status
-        task_status="$(python - "$task_manifest" <<'PY'
+        local resume_check_rc
+        resume_check_rc="$(python - "$task_manifest" "$MAX_GEN_TOKS" "$MAX_MODEL_LEN" "$PROJECT_DIR/scripts/validate_generation_task.py" <<'PY'
+import json, os, sys
+
+manifest_path = sys.argv[1]
+max_gen_toks = int(sys.argv[2])
+max_model_len = int(sys.argv[3])
+validate_py = sys.argv[4]
+
+# 添加 scripts 目录到 path
+sys.path.insert(0, os.path.dirname(validate_py))
+try:
+    from validate_generation_task import (
+        validate_lm_eval_sample_file,
+        validate_exported_generation_file,
+    )
+except ImportError:
+    print("import_error")
+    sys.exit(0)
+
+try:
+    with open(manifest_path, encoding="utf-8") as f:
+        tm = json.load(f)
+except Exception:
+    print("manifest_parse_error")
+    sys.exit(0)
+
+if tm.get("status") != "complete":
+    print("not_complete")
+    sys.exit(0)
+
+# 验证 max_gen_toks
+if tm.get("max_gen_toks") != max_gen_toks:
+    print("config_mismatch")
+    sys.exit(0)
+
+# 验证 max_model_len
+if int(tm.get("max_model_len", 0)) < max_gen_toks:
+    print("config_mismatch")
+    sys.exit(0)
+
+# 验证 sample 文件
+sample_file = tm.get("lm_eval_sample_file")
+expected_count = tm.get("expected_sample_count", 0)
+if sample_file and os.path.isfile(sample_file):
+    errors = validate_lm_eval_sample_file(
+        sample_file, tm.get("task", ""),
+        expected_count, max_gen_toks
+    )
+    if errors:
+        print("sample_validation_failed")
+        sys.exit(0)
+else:
+    print("sample_missing")
+    sys.exit(0)
+
+# 验证导出文件
+export_file = tm.get("exported_generation_file")
+if export_file and os.path.isfile(export_file) and os.path.getsize(export_file) > 0:
+    errors = validate_exported_generation_file(
+        export_file, expected_count, max_gen_toks
+    )
+    if errors:
+        print("export_validation_failed")
+        sys.exit(0)
+else:
+    print("export_missing")
+    sys.exit(0)
+
+# 验证 export_status
+if tm.get("export_status") != "complete":
+    print("export_not_complete")
+    sys.exit(0)
+
+print("ok")
+PY
+)" || resume_check_rc="error"
+
+        if [[ "$resume_check_rc" == "ok" ]]; then
+            log "[skip] task $task 已完成并通过验证（断点恢复），跳过。"
+            # 读取成功配置供后续 task 使用
+            if [[ -z "$FIRST_TASK_CONFIG" ]]; then
+                FIRST_TASK_CONFIG="$(python - "$task_manifest" <<'PY'
 import json, sys
 try:
     m = json.load(open(sys.argv[1], encoding="utf-8"))
-    print(m.get("status", ""))
+    level = m.get("fallback_level", 0)
+    mnbt = m["max_num_batched_tokens"]
+    mns = m["max_num_seqs"]
+    gmu = m["gpu_memory_utilization"]
+    pc = "True" if m["enable_prefix_caching"] else "False"
+    print(f"{level} {mnbt} {mns} {gmu} {pc}")
 except Exception:
     print("")
 PY
-)" || task_status=""
-        if [[ "$task_status" == "complete" ]]; then
-            log "[skip] task $task 已完成（断点恢复），跳过。"
+)" || FIRST_TASK_CONFIG=""
+                if [[ -n "$FIRST_TASK_CONFIG" ]]; then
+                    SUCCESS_LEVEL="$(echo "$FIRST_TASK_CONFIG" | cut -d' ' -f1)"
+                    SUCCESS_MNBT="$(echo "$FIRST_TASK_CONFIG" | cut -d' ' -f2)"
+                    SUCCESS_MNS="$(echo "$FIRST_TASK_CONFIG" | cut -d' ' -f3)"
+                    SUCCESS_GMU="$(echo "$FIRST_TASK_CONFIG" | cut -d' ' -f4)"
+                    SUCCESS_PC="$(echo "$FIRST_TASK_CONFIG" | cut -d' ' -f5)"
+                fi
+            fi
             return 0
+        else
+            log "[resume] task $task 检查结果: $resume_check_rc，将重新运行。"
         fi
     fi
 
@@ -433,7 +576,7 @@ PY
 
         if [[ "$epc" == "True" ]]; then prefix_caching="True"; else prefix_caching="False"; fi
 
-        local model_args="pretrained=${MODEL_PATH},dtype=bfloat16,tensor_parallel_size=1,gpu_memory_utilization=${gmu},max_model_len=${MAX_MODEL_LEN},max_num_batched_tokens=${mnbt},max_num_seqs=${mns},enable_prefix_caching=${prefix_caching},trust_remote_code=True"
+        local model_args="pretrained=${MODEL_PATH},dtype=bfloat16,tensor_parallel_size=1,gpu_memory_utilization=${gmu},max_model_len=${MAX_MODEL_LEN},max_num_batched_tokens=${mnbt},max_num_seqs=${mns},enable_prefix_caching=${prefix_caching},enable_chunked_prefill=True,trust_remote_code=True"
         local gen_kwargs="do_sample=False,temperature=0.0,max_gen_toks=${MAX_GEN_TOKS}"
 
         log "---- task=$task attempt $task_attempt / ${#task_configs[@]} ----"
@@ -442,6 +585,7 @@ PY
         log "  max_num_seqs            = $mns"
         log "  gpu_memory_utilization  = $gmu"
         log "  enable_prefix_caching   = $prefix_caching"
+        log "  enable_chunked_prefill  = True"
         log "  max_gen_toks            = $MAX_GEN_TOKS (固定)"
         log "  max_model_len           = $MAX_MODEL_LEN (固定)"
         log "  predict_only            = true"
@@ -485,14 +629,14 @@ PY
 
         log "  attempt $task_attempt exit code = $rc, elapsed = ${attempt_elapsed}s"
 
-        # 记录 attempt 信息
+        # 记录 attempt 信息（初始状态: success 或 unknown_error）
         task_attempts_json="$(python - "$task_attempts_json" "$task_attempt" "$rc" "$attempt_elapsed" <<'PY'
 import json, sys
 arr = json.loads(sys.argv[1])
 att = int(sys.argv[2])
 rc = int(sys.argv[3])
 elapsed = int(sys.argv[4])
-status = "success" if rc == 0 else "oom" if rc != 0 else "failed"
+status = "success" if rc == 0 else "unknown_error"
 arr.append({"attempt": att, "exit_code": rc, "elapsed_seconds": elapsed, "status": status})
 print(json.dumps(arr))
 PY
@@ -508,24 +652,23 @@ PY
             task_success_level=$level
             task_success_elapsed=$attempt_elapsed
 
-            # 成功后确认 vLLM 进程退出
-            wait_gpu_free "task=$task success cleanup" 30 || {
-                log "[WARN] task=$task 成功后 GPU 仍有进程，继续等待..." >&2
-            }
+            # 成功后确认 vLLM 进程退出（必须返回错误，不能只 warning）
+            if ! wait_gpu_free "task=$task success cleanup" 60; then
+                log "[ERROR] task=$task 完成后 GPU 仍有残留进程" >&2
+                return 7
+            fi
             break
         fi
 
-        # 判断是否 OOM
-        if grep -qiE "out of memory|OutOfMemoryError|CUDA error|HBM out of memory|torch\.cuda\.OutOfMemoryError" "$attempt_log"; then
+        # 判断是否 OOM（缩小匹配范围，不匹配笼统的 "CUDA error"）
+        if grep -qiE "CUDA out of memory|torch\.cuda\.OutOfMemoryError|OutOfMemoryError|HBM out of memory|CUDA error: out of memory|The model's max seq len.*larger than the maximum number of tokens" "$attempt_log"; then
             log "  检测到 OOM，按 fallback 策略降低调度参数后重试。"
             # 更新 attempt 状态为 oom
-            task_attempts_json="$(python - "$task_attempts_json" "$task_attempt" <<'PY'
+            task_attempts_json="$(python - "$task_attempts_json" <<'PY'
 import json, sys
 arr = json.loads(sys.argv[1])
-att = int(sys.argv[2])
-for a in arr:
-    if a["attempt"] == att:
-        a["status"] = "oom"
+if arr:
+    arr[-1]["status"] = "oom"
 print(json.dumps(arr))
 PY
 )"
@@ -539,13 +682,11 @@ PY
             log "  错误摘要（最后 20 行）:" >&2
             tail -20 "$attempt_log" >&2 || true
             # 更新 attempt 状态为 error
-            task_attempts_json="$(python - "$task_attempts_json" "$task_attempt" <<'PY'
+            task_attempts_json="$(python - "$task_attempts_json" <<'PY'
 import json, sys
 arr = json.loads(sys.argv[1])
-att = int(sys.argv[2])
-for a in arr:
-    if a["attempt"] == att:
-        a["status"] = "error"
+if arr:
+    arr[-1]["status"] = "error"
 print(json.dumps(arr))
 PY
 )"
@@ -599,13 +740,14 @@ PY
         "$task_success_elapsed" \
         "$task_attempts_json" \
         "$GPU_INDEX" \
+        "$task_success_attempt" \
         <<'PYEOF'
 import json, os, sys, glob
 
 (manifest_path, lm_eval_output, task, max_gen_toks, max_model_len,
  mnbt, mns, gmu, epc, level, model_path, run_name, run_id,
  expected_counts_json, eval_limit, success_elapsed, attempts_json,
- gpu_index) = sys.argv[1:19]
+ gpu_index, task_success_attempt_num) = sys.argv[1:20]
 
 max_gen_toks = int(max_gen_toks)
 max_model_len = int(max_model_len)
@@ -613,6 +755,7 @@ mnbt = int(mnbt)
 mns = int(mns)
 level = int(level)
 success_elapsed = int(success_elapsed)
+task_success_attempt_num = int(task_success_attempt_num)
 expected_counts = json.loads(expected_counts_json)
 attempts = json.loads(attempts_json)
 
@@ -675,7 +818,59 @@ else:
     sample_file = matches[0]
     print(f"[discover] sample {task}: {sample_file}")
 
-# --- 4. sample JSONL 完整性检查 ---
+# --- 4. sample JSONL 完整性检查 (使用 validate_generation_task 函数) ---
+import sys as _sys
+_sys.path.insert(0, os.path.join(os.path.dirname(__file__) if '__file__' in dir() else '.', 'scripts'))
+try:
+    from validate_generation_task import extract_output, extract_doc_id, extract_prompt
+except ImportError:
+    # fallback: 内联定义
+    def extract_output(obj):
+        for key in ("resps", "filtered_resps"):
+            resps = obj.get(key)
+            if resps is None:
+                continue
+            if isinstance(resps, list) and len(resps) > 0:
+                first = resps[0]
+                if isinstance(first, list) and len(first) > 0:
+                    return str(first[0])
+                if isinstance(first, str):
+                    return first
+        return ""
+
+    def extract_doc_id(obj, line_num=0):
+        did = obj.get("doc_id")
+        if did is None:
+            did = obj.get("id")
+        if did is None:
+            did = line_num
+        return did
+
+    def extract_prompt(obj):
+        arguments = obj.get("arguments")
+        if isinstance(arguments, dict):
+            gen_args = arguments.get("gen_args_0")
+            if isinstance(gen_args, dict):
+                p = gen_args.get("arg_0")
+                if p is not None:
+                    return str(p)
+            for key in sorted(arguments):
+                group = arguments.get(key)
+                if not isinstance(group, dict):
+                    continue
+                if "arg_0" in group and group["arg_0"] is not None:
+                    return str(group["arg_0"])
+        if isinstance(arguments, (list, tuple)) and arguments:
+            first = arguments[0]
+            if isinstance(first, (list, tuple)) and first:
+                return str(first[0])
+            if isinstance(first, str):
+                return first
+        prompt = obj.get("prompt")
+        if prompt is not None:
+            return str(prompt)
+        return ""
+
 actual_count = 0
 seen_ids = set()
 has_empty_output = False
@@ -691,27 +886,23 @@ if sample_file:
             except json.JSONDecodeError:
                 errors.append(f"task '{task}' sample JSONL 第 {line_num} 行解析失败")
                 continue
-            # doc_id 唯一性
-            did = obj.get("doc_id") or obj.get("id") or str(line_num)
+            # doc_id 唯一性 (修复: 0 是有效 doc_id，不能用 or 链)
+            did = extract_doc_id(obj, line_num)
             if did in seen_ids:
                 errors.append(f"task '{task}' 存在重复 sample (doc_id={did})")
             seen_ids.add(did)
-            # 检查输出非空
-            resps = obj.get("resps") or obj.get("filtered_resps")
-            if resps is None:
+            # 检查输出非空 (空输出必须加入 errors)
+            output_text = extract_output(obj)
+            if not output_text.strip():
+                errors.append(f"task '{task}' 第 {line_num} 行模型输出为空")
+                has_empty_output = True
+            # 检查 resps 或 filtered_resps 存在
+            if obj.get("resps") is None and obj.get("filtered_resps") is None:
                 errors.append(f"task '{task}' 第 {line_num} 行缺少 resps/filtered_resps")
-            elif isinstance(resps, list) and len(resps) > 0:
-                first = resps[0]
-                if isinstance(first, list) and len(first) > 0:
-                    if not str(first[0]).strip():
-                        has_empty_output = True
-                elif isinstance(first, str) and not first.strip():
-                    has_empty_output = True
-            # 检查 prompt 或 arguments 存在
-            has_prompt = (obj.get("arguments") is not None or
-                          obj.get("prompt") is not None or
-                          obj.get("doc") is not None)
-            if not has_prompt:
+            # 检查 prompt 或 arguments 或 doc 存在
+            prompt_text = extract_prompt(obj)
+            has_doc = obj.get("doc") is not None
+            if not prompt_text and not has_doc:
                 errors.append(f"task '{task}' 第 {line_num} 行缺少 prompt/arguments/doc")
 
     print(f"[count] {task}: {actual_count} samples")
@@ -788,6 +979,7 @@ manifest = {
     "max_num_seqs": mns,
     "gpu_memory_utilization": float(gmu),
     "enable_prefix_caching": (epc == "True"),
+    "enable_chunked_prefill": True,
     "fallback_level": level,
     "tensor_parallel_size": 1,
     "cuda_visible_devices": gpu_index,
@@ -803,7 +995,7 @@ manifest = {
     "accelerate_version": ver("accelerate"),
     "datasets_version": ver("datasets"),
     "git_commit": git_commit,
-    "successful_attempt": len(attempts),
+    "successful_attempt": task_success_attempt_num,
     "successful_attempt_elapsed_seconds": success_elapsed,
     "failed_attempt_elapsed_seconds": failed_attempt_elapsed,
     "pipeline_elapsed_seconds": total_attempt_elapsed,
@@ -838,7 +1030,7 @@ PYEOF
 
     log "task=$task 完成。成功 attempt=$task_success_attempt, level=$task_success_level, 耗时=${task_success_elapsed}s"
 
-    # 导出该 task 的统一 JSONL
+    # 导出该 task 的统一 JSONL（导出失败必须阻断完成）
     local export_py="$PROJECT_DIR/scripts/export_generation_outputs.py"
     if [[ -f "$export_py" ]]; then
         log "导出 $task 的统一 JSONL ..."
@@ -860,12 +1052,77 @@ PYEOF
             smoke_suffix="_smoke${EVAL_LIMIT}"
         fi
         local export_out="$PROJECT_DIR/results/generated_outputs/${model_short}_${bench_short}${smoke_suffix}.jsonl"
+
+        local EXPORT_RC=0
         python "$export_py" \
             --task_manifest "$task_manifest" \
             --model_name "$RUN_NAME" \
             --model_path "$MODEL_PATH" \
             --out "$export_out" \
-            2>&1 | tee -a "$RUNTIME_LOG" || log "[WARN] 导出 $task JSONL 失败（不影响评测完整性）。"
+            2>&1 | tee -a "$RUNTIME_LOG" || EXPORT_RC=$?
+
+        if (( EXPORT_RC != 0 )); then
+            log "[ERROR] task=$task 统一 JSONL 导出失败，exit=$EXPORT_RC" >&2
+            # 更新 task manifest 标记为 incomplete
+            python - "$task_manifest" "$EXPORT_RC" "$export_out" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+rc = int(sys.argv[2])
+export_out = sys.argv[3]
+manifest = {}
+if os.path.isfile(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            manifest = json.load(f)
+    except Exception:
+        manifest = {}
+manifest["status"] = "incomplete"
+manifest["export_status"] = "failed"
+manifest["exported_generation_file"] = export_out
+manifest["completion_errors"] = list(manifest.get("completion_errors", []))
+manifest["completion_errors"].append(f"统一 JSONL 导出失败，exit={rc}")
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(manifest, f, ensure_ascii=False, indent=2)
+os.replace(tmp, path)
+PY
+            return 9
+        fi
+
+        # 验证导出文件非空
+        if [[ ! -s "$export_out" ]]; then
+            log "[ERROR] 导出的统一 JSONL 不存在或为空: $export_out" >&2
+            return 9
+        fi
+
+        # 更新 task manifest 添加导出信息
+        python - "$task_manifest" "$export_out" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+export_out = sys.argv[2]
+with open(path, encoding="utf-8") as f:
+    manifest = json.load(f)
+manifest["export_status"] = "complete"
+manifest["exported_generation_file"] = export_out
+# 统计导出记录数
+count = 0
+with open(export_out, encoding="utf-8") as f:
+    for line in f:
+        if line.strip():
+            count += 1
+manifest["exported_sample_count"] = count
+manifest["export_empty_output_count"] = 0
+manifest["export_empty_prompt_count"] = 0
+manifest["export_empty_question_count"] = 0
+manifest["export_duplicate_count"] = 0
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(manifest, f, ensure_ascii=False, indent=2)
+os.replace(tmp, path)
+PY
+        log "task=$task 统一 JSONL 导出完成: $export_out"
+    else
+        log "[WARN] export_generation_outputs.py 不存在，跳过导出" >&2
     fi
 
     return 0
@@ -1053,6 +1310,24 @@ for task, tm in task_manifests.items():
     if sf:
         sample_files[task] = sf
 
+# 合并所有 task 的导出文件路径
+exported_files = {}
+export_errors = []
+for task, tm in task_manifests.items():
+    ef = tm.get("exported_generation_file")
+    if ef:
+        exported_files[task] = ef
+        # 验证导出文件存在且非空
+        if not os.path.isfile(ef):
+            export_errors.append(f"task '{task}' exported_generation_file 不存在: {ef}")
+        elif os.path.getsize(ef) == 0:
+            export_errors.append(f"task '{task}' exported_generation_file 为空: {ef}")
+    else:
+        export_errors.append(f"task '{task}' 缺少 exported_generation_file")
+    # 验证 export_status
+    if tm.get("export_status") != "complete":
+        export_errors.append(f"task '{task}' export_status={tm.get('export_status')}")
+
 # 合并所有 task 的 results 文件路径
 results_file = None
 for task, tm in task_manifests.items():
@@ -1061,7 +1336,7 @@ for task, tm in task_manifests.items():
         results_file = rf
         break
 
-run_errors = list(task_errors)
+run_errors = list(task_errors) + export_errors
 if all_task_success != 1:
     run_errors.append("部分 task 失败")
 
@@ -1086,6 +1361,7 @@ manifest = {
     "max_num_seqs": int(success_mns) if success_mns else 0,
     "gpu_memory_utilization": float(success_gmu) if success_gmu else 0.0,
     "enable_prefix_caching": (success_pc == "True") if success_pc else False,
+    "enable_chunked_prefill": True,
     "fallback_level": int(success_level) if success_level else 0,
     "tensor_parallel_size": 1,
     "cuda_visible_devices": gpu_index,
@@ -1117,6 +1393,7 @@ manifest = {
                        for t in task_manifests},
     "lm_eval_results_file": results_file,
     "lm_eval_sample_files": sample_files,
+    "exported_generation_files": exported_files,
     "completion_errors": run_errors,
 }
 
