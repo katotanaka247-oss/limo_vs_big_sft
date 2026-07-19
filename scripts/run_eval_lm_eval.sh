@@ -1,12 +1,21 @@
 #!/bin/bash
-# run_eval_lm_eval.sh
-# 使用 lm-evaluation-harness 评测模型
-# 用法: bash scripts/run_eval_lm_eval.sh [BASE_MODEL] [MODEL_PATH] [OUTPUT_DIR] [TASKS]
+# run_eval_lm_eval.sh   [已废弃 / DEPRECATED]
+#
+# ⚠️ 本脚本仅用于快速调试，不应作为正式评测脚本。原因:
+#   1. 固定使用 Transformers `hf` backend，无 vLLM continuous batching，极慢；
+#   2. 写死 --batch_size 1；
+#   3. 直接动态挂载 PEFT adapter（而非合并为 BF16 独立模型）；
+#   4. 默认 task 名 `math500` 含糊（应为 `hendrycks_math500`），且不含 AIME25；
+#   5. 未设置 max_gen_toks=32768，会使用默认小值，无法评测长推理；
+#   6. 无 OOM fallback / 断点保护 / 效率统计。
+#
+# 正式评测请改用:
+#   bash scripts/run_eval_two_models_single_l40.sh
+# 详见 README 中「单卡 L40：MATH500、AIME24、AIME25，32K 最大生成长度评测」章节。
+#
+# 用法（调试用）: bash scripts/run_eval_lm_eval.sh [BASE_MODEL] [MODEL_PATH] [OUTPUT_DIR] [TASKS]
 # 示例:
-#   # 评测 LoRA adapter
-#   bash scripts/run_eval_lm_eval.sh meta-llama/Llama-3.1-8B outputs/llama31_8b_limo_817_qlora results/limo_817 "gsm8k,math500,aime24"
-#   # 评测 merged model
-#   bash scripts/run_eval_lm_eval.sh "" outputs/llama31_8b_limo_817_merged results/limo_817_merged "gsm8k,math500,aime24"
+#   bash scripts/run_eval_lm_eval.sh "" outputs/llama31_8b_limo_817_merged results/limo_817_dbg "hendrycks_math500,aime24,aime25"
 
 set -e
 

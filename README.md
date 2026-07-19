@@ -168,51 +168,168 @@ python scripts/merge_lora.py \
     --out_dir outputs/llama31_8b_limo_817_merged
 ```
 
-## 评测
+## 单卡 L40：MATH500、AIME24、AIME25，32K 最大生成长度评测
 
-### 检查可用任务名
+本章节是**正式评测流程**。在单张 NVIDIA L40 48GB 上，用 lm-evaluation-harness 的 **vLLM backend**
+（continuous batching）串行评测两个模型，最大生成长度严格为 **32768 tokens**，两模型使用完全相同的
+backend / prompt / task / 生成参数，仅 LoRA adapter 与输出目录不同。
 
-不同版本的 `lm-evaluation-harness` 任务名可能不同，请先检查：
+> 旧脚本 `scripts/run_eval_lm_eval.sh`（Transformers `hf` backend + `batch_size=1` + 含糊的 `math500` 任务名）
+> 已废弃，仅保留作快速调试，详见文件头注释。
 
-```bash
-lm_eval ls tasks | grep -E "gsm8k|math|aime"
-```
+### 1. 创建独立评测环境
 
-### 评测 LoRA Adapter（PEFT 模式）
-
-```bash
-bash scripts/run_eval_lm_eval.sh \
-    meta-llama/Llama-3.1-8B \
-    outputs/llama31_8b_limo_817_qlora \
-    results/limo_817 \
-    "gsm8k,math500,aime24"
-```
-
-**Note:** 评测脚本默认使用 `--gen_kwargs "do_sample=False,temperature=0.0"` 强制 greedy decoding。
-如果本地 `lm-evaluation-harness` 版本不支持 `--gen_kwargs`，请编辑 `scripts/run_eval_lm_eval.sh` 删除该行，
-或根据本地版本调整为 `--generation_kwargs`（较旧版本）。目标是所有模型评测时使用 greedy decoding，保证公平。
-
-### 评测 Merged Model（独立模型）
+vLLM 仅支持 Linux，且会改变 torch / transformers 版本，**不要污染训练环境**：
 
 ```bash
-bash scripts/run_eval_lm_eval.sh \
-    "" \
-    outputs/llama31_8b_limo_817_merged \
-    results/limo_817_merged \
-    "gsm8k,math500,aime24"
+conda create -n limo_eval_vllm python=3.10 -y
+conda activate limo_eval_vllm
+pip install -r requirements-eval-vllm.txt
 ```
 
-### 自定义评测任务
+锁定版本（已验证 `hendrycks_math500` / `aime24` / `aime25` 三个 task 均存在）：
 
-通过第 4 个参数覆盖默认任务名：
+| 包 | 版本 | 说明 |
+|---|---|---|
+| `lm_eval` | `0.4.9.2` | 首个含 `aime25` 的稳定版 |
+| `vllm` | `0.8.5.post1` | L40(sm89) 验证可用，支持 bf16 / prefix caching |
+| `torch` | `2.5.1` | vLLM 0.8.5 要求 |
+| `transformers` | `4.46.3` | 与 vLLM 0.8.5 兼容 |
+| `math_verify` | `0.7.0` | AIME / MATH 答案抽取 |
+
+脚本运行时会执行 `lm_eval ls tasks` 校验三个 task 真实存在；若 `aime25` 缺失会**明确报错**
+（提示当前 lm-eval 版本），绝不静默换成其他 task。
+
+### 2. 合并 LoRA Adapter 为 BF16 独立模型
+
+vLLM 不支持动态挂载 QLoRA adapter 做正式评测（会退回慢速路径），因此先合并为 BF16 独立模型。
+合并在 CPU 上完成，不占用 GPU：
 
 ```bash
-bash scripts/run_eval_lm_eval.sh \
-    meta-llama/Llama-3.1-8B \
-    outputs/llama31_8b_limo_817_qlora \
-    results/limo_817 \
-    "gsm8k,cmath,mathqa"
+# LIMO-817
+python scripts/merge_lora.py \
+  --base_model meta-llama/Llama-3.1-8B \
+  --adapter_dir outputs/llama31_8b_limo_817_qlora \
+  --out_dir outputs/llama31_8b_limo_817_merged
+
+# OpenR1-Math-10K
+python scripts/merge_lora.py \
+  --base_model meta-llama/Llama-3.1-8B \
+  --adapter_dir outputs/llama31_8b_openr1_10k_qlora \
+  --out_dir outputs/llama31_8b_openr1_10k_merged
 ```
+
+`merge_lora.py` 行为：BF16 加载、`PeftModel.from_pretrained` + `merge_and_unload`、`safe_serialization=True`、
+优先用 adapter 目录 tokenizer（缺失回退 base）、目录已存在且完整则跳过（`--overwrite` 强制重做）、
+目录存在但不完整则**报错**（不静默跳过）、合并后打印 dtype / 参数规模。
+
+### 3. 固定生成参数（三 benchmark 统一）
+
+```
+do_sample=False
+temperature=0.0
+max_gen_toks=32768
+```
+
+- `max_gen_toks=32768` 通过 CLI `--gen_kwargs "do_sample=False,temperature=0.0,max_gen_toks=32768"` 传入，
+  会以 `update=True` 合并覆盖各 task YAML 的 `generation_kwargs`（lm-eval 0.4.9.2 行为已确认）；
+  `hendrycks_math500` 父配置不含 `max_gen_toks`，必须由 CLI 覆盖，否则只会生成默认 256 token。
+- 脚本会在日志中校验 `max_gen_toks=32768` 确实生效。
+
+### 4. vLLM 参数（单卡 L40 默认）
+
+```
+tensor_parallel_size=1
+dtype=bfloat16
+gpu_memory_utilization=0.92
+max_model_len=40960
+max_num_batched_tokens=8192
+enable_prefix_caching=True
+trust_remote_code=True
+--batch_size auto
+--max_batch_size 32
+```
+
+- `max_model_len=40960` 同时容纳输入 prompt + 32768 输出；评测前 `scripts/check_prompt_lengths.py`
+  会统计最长 prompt，并强制校验 `max_prompt_tokens + 32768 <= max_model_len`，不满足则**终止报错**，
+  绝不截断 prompt 或降低 `max_gen_toks`（必要时把 `MAX_MODEL_LEN` 增大到 49152 并记入 manifest）。
+- OOM fallback 顺序：`max_num_batched_tokens` 8192→4096→2048，`max_batch_size` 32→16→8→4，
+  `gpu_memory_utilization` 0.92→0.90→0.88，关闭 prefix caching。**绝不降低 `max_gen_toks` 或更换 task/prompt**。
+
+### 5. Smoke Test（每 benchmark 2 条样本）
+
+```bash
+CUDA_VISIBLE_DEVICES=0 EVAL_LIMIT=2 \
+bash scripts/run_eval_two_models_single_l40.sh
+```
+
+Smoke test 结果写入独立目录（`results/*_smoke2`），不会覆盖全量结果。
+
+### 6. 全量正式评测
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+bash scripts/run_eval_two_models_single_l40.sh
+```
+
+脚本串行执行：合并 LIMO → vLLM 评测 LIMO → 退出释放显存 → 合并 OpenR1 → vLLM 评测 OpenR1 → 汇总。
+两个模型分别在独立 Python/lm_eval 进程中运行，**严禁并发**；启动第二个模型前会用
+`nvidia-smi --query-compute-apps` 确认前一个进程已退出，否则报错拒绝继续。
+
+### 7. 查看 GPU 与进度
+
+```bash
+# GPU 占用
+watch -n 2 nvidia-smi
+
+# LIMO 进度
+tail -f results/limo_817_math500_aime24_aime25_32k/runtime.log
+
+# OpenR1-10K 进度
+tail -f results/openr1_10k_math500_aime24_aime25_32k/runtime.log
+```
+
+### 8. 结果与效率统计
+
+每个模型目录至少包含：
+
+```
+results/limo_817_math500_aime24_aime25_32k/
+  results.json                 # lm-eval 原始结果
+  samples/                     # per-sample jsonl
+  run_manifest.json            # 完整运行配置（原子写入，status=complete 才算完成）
+  runtime.log
+  efficiency_summary.json
+  prompt_length_check.json
+  nvidia_smi.log               # GPU 显存采样
+  attempt_*.log                # OOM fallback 各次尝试日志
+```
+
+汇总对比（两模型）：
+
+```
+results/comparison_math500_aime24_aime25_32k.json
+results/comparison_math500_aime24_aime25_32k.csv
+results/comparison_math500_aime24_aime25_32k.md
+```
+
+汇总表包含：accuracy、avg output tokens、P90 tokens、truncation rate、total time、tokens/s 等，
+用于判断「LIMO 推理更慢是后端问题还是其生成更长更冗余的推理过程」。
+
+### 9. 断点保护与强制重跑
+
+- 结果目录已有完整结果（`run_manifest.json` 中 `status=complete`）时默认跳过；
+- manifest 存在但未 complete 视为中断的损坏结果，**报错**而非当成完成；
+- `FORCE_RERUN=1` 强制重跑：
+  ```bash
+  FORCE_RERUN=1 CUDA_VISIBLE_DEVICES=0 bash scripts/run_eval_two_models_single_l40.sh
+  ```
+- `SKIP_MERGE=1` 跳过合并步骤（merged model 已存在时）。
+
+### 10. 旧脚本（仅调试，已废弃）
+
+`scripts/run_eval_lm_eval.sh` 仍可用于 transformers backend 的快速调试，但**不可作为正式评测**，
+原因见文件头注释。
 
 ## 输出目录说明
 

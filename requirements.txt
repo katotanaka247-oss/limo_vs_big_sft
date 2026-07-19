@@ -1,3 +1,12 @@
+# requirements.txt —— 训练环境依赖（QLoRA 微调）
+# ⚠️ 评测请勿使用本文件。vLLM 评测需要单独环境，见 requirements-eval-vllm.txt
+# 评测环境安装:
+#   conda create -n limo_eval_vllm python=3.10 -y
+#   conda activate limo_eval_vllm
+#   pip install -r requirements-eval-vllm.txt
+#
+# 说明: 旧的 `lm-eval>=0.4.0` 版本过宽，不含 AIME25 task，且无 vllm 依赖，
+# 已移至 requirements-eval-vllm.txt 并锁定为 lm_eval==0.4.9.2 + vllm==0.8.5.post1。
 torch>=2.1.0
 transformers>=4.43.0
 peft>=0.11.0
@@ -6,5 +15,4 @@ datasets>=2.20.0
 accelerate>=0.33.0
 sentencepiece>=0.2.0
 protobuf>=4.25.0
-lm-eval>=0.4.0
 numpy>=1.26.0

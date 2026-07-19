@@ -1,0 +1,34 @@
+# requirements-eval-vllm.txt
+# 单卡 L40 vLLM 评测专用依赖（与训练环境隔离，建议单独建 conda 环境）
+#
+# 版本选择依据:
+#   * lm-eval==0.4.9.2 —— 首个同时包含 hendrycks_math500 / aime24 / aime25 三个 task
+#     的稳定发布版（aime25 的 yaml 在 0.4.9.2 才出现；0.4.6/0.4.8 均无 aime25）。
+#     三个 task 的 yaml 均含 max_gen_toks=32768（math500 经父配置继承后无该字段，
+#     由 CLI --gen_kwargs 显式覆盖为 32768）。
+#   * vllm==0.8.5.post1 —— 在 L40(sm89) 上经广泛验证的稳定版，支持 bf16、
+#     continuous batching、prefix caching；与 lm-eval 0.4.9.2 的 vLLM backend 兼容。
+#   * torch==2.5.1 —— vLLM 0.8.5 要求的 torch 版本。
+#   * 其余为对应兼容版本。
+#
+# 安装:
+#   conda create -n limo_eval_vllm python=3.10 -y
+#   conda activate limo_eval_vllm
+#   pip install -r requirements-eval-vllm.txt
+#
+# 注意: vLLM 仅支持 Linux，不能在 Windows 上原生运行；请在 L40 服务器上安装。
+# 脚本会在运行时校验 task 名是否存在，若 lm-eval 版本不含 aime25 会明确报错。
+
+torch==2.5.1
+transformers==4.46.3
+accelerate==1.1.1
+peft==0.13.2
+vllm==0.8.5.post1
+lm_eval==0.4.9.2
+math_verify==0.7.0
+datasets==3.1.0
+sentencepiece==0.2.0
+protobuf==5.28.3
+numpy==1.26.4
+pyyaml>=6.0.2
+scipy>=1.13.0
