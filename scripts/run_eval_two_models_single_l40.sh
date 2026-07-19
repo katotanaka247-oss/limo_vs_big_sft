@@ -1,290 +1,410 @@
 #!/bin/bash
 # run_eval_two_models_single_l40.sh
-# 在单卡 L40 上串行评测两个模型（LIMO-817 与 OpenR1-10K），
-# 严禁并发，严禁两个模型同时占用 GPU。
+# 串行运行 LIMO-817 和 OpenR1-10K 两个模型的 generation-only 评测。
 #
 # 流程:
-#   检查 GPU 空闲
+#   检查目标 GPU 空闲
 #   → 合并/验证 LIMO merged model
-#   → 评测 LIMO（找到成功配置）
-#   → 验证输出 → 退出并释放 GPU
-#   → 检查 GPU 空闲
+#   → 评测 LIMO (3 个 task 串行)
+#   → 验证输出
+#   → 退出并释放 GPU
+#   → 确认目标 GPU 空闲
 #   → 合并/验证 OpenR1 merged model
-#   → 评测 OpenR1（使用与 LIMO 相同的配置）
-#   → 验证输出 → 退出并释放 GPU
-#   → 检查配置一致性 → 必要时重跑
+#   → 评测 OpenR1 (使用 LIMO 的成功配置)
+#   → 如果 OpenR1 OOM → fallback → 用新配置重跑 LIMO
+#   → 验证输出
+#   → 退出并释放 GPU
 #   → 汇总
 #
-# 共同配置机制:
-#   1. LIMO 通过 fallback 找到成功配置
-#   2. OpenR1 使用相同配置（FORCE_CONFIG）
-#   3. 如果 OpenR1 OOM，OpenR1 走 fallback 找到更保守配置
-#   4. 用新配置 FORCE_RERUN 重跑 LIMO
-#   5. 最终两个模型 manifest 中调度参数必须一致
-#
-# 用法:
-#   bash scripts/run_eval_two_models_single_l40.sh
-#   EVAL_LIMIT=2 bash scripts/run_eval_two_models_single_l40.sh   # smoke test
+# 两个模型必须串行运行，禁止并发。
+# 两个模型必须使用相同最终调度配置才能公平比较 tokens/s。
 
 set -euo pipefail
-
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
-
-# 拒绝多卡
-if [[ "$CUDA_VISIBLE_DEVICES" == *,* ]]; then
-    echo "[ERROR] CUDA_VISIBLE_DEVICES='$CUDA_VISIBLE_DEVICES' 包含逗号，本实验只允许单卡。" >&2
-    exit 2
-fi
-
-BASE_MODEL="${BASE_MODEL:-meta-llama/Llama-3.1-8B}"
-EVAL_LIMIT="${EVAL_LIMIT:-}"
-FORCE_RERUN="${FORCE_RERUN:-0}"
-SKIP_MERGE="${SKIP_MERGE:-0}"
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
 
-# smoke test 用独立结果目录，避免覆盖全量结果
-if [[ -n "$EVAL_LIMIT" ]]; then
-    LIMO_DIR="results/limo_817_math500_aime24_aime25_32k_smoke${EVAL_LIMIT}"
-    OPENR1_DIR="results/openr1_10k_math500_aime24_aime25_32k_smoke${EVAL_LIMIT}"
-else
-    LIMO_DIR="results/limo_817_math500_aime24_aime25_32k"
-    OPENR1_DIR="results/openr1_10k_math500_aime24_aime25_32k"
-fi
-
+# ---------- 路径 ----------
+BASE_MODEL="meta-llama/Llama-3.1-8B"
 LIMO_ADAPTER="outputs/llama31_8b_limo_817_qlora"
 LIMO_MERGED="outputs/llama31_8b_limo_817_merged"
 OPENR1_ADAPTER="outputs/llama31_8b_openr1_10k_qlora"
 OPENR1_MERGED="outputs/llama31_8b_openr1_10k_merged"
 
-ORCH_LOG="$PROJECT_DIR/orchestrator_$(date +%Y%m%d_%H%M%S).log"
-log() { echo "[$(date '+%F %T')] $*" | tee -a "$ORCH_LOG"; }
+EVAL_LIMIT="${EVAL_LIMIT:-}"
+SMOKE_SUFFIX=""
+if [[ -n "$EVAL_LIMIT" ]]; then
+    SMOKE_SUFFIX="_smoke${EVAL_LIMIT}"
+fi
 
-log "================ 两模型串行评测 (单卡 L40) ================"
-log "CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
-log "BASE_MODEL           = $BASE_MODEL"
-log "EVAL_LIMIT           = ${EVAL_LIMIT:-<全量>}"
-log "FORCE_RERUN          = $FORCE_RERUN"
-log "SKIP_MERGE           = $SKIP_MERGE"
-log "LIMO_DIR             = $LIMO_DIR"
-log "OPENR1_DIR           = $OPENR1_DIR"
-log "orchestrator log     = $ORCH_LOG"
+LIMO_DIR="results/limo_817_math500_aime24_aime25_32k${SMOKE_SUFFIX}"
+OPENR1_DIR="results/openr1_10k_math500_aime24_aime25_32k${SMOKE_SUFFIX}"
+SKIP_MERGE="${SKIP_MERGE:-0}"
+FORCE_RERUN="${FORCE_RERUN:-0}"
 
-# ---------- 工具函数 ----------
-# 确认目标 GPU 上没有进程（只检查目标卡，不检查其他卡）
+LOG_FILE="$PROJECT_DIR/results/two_models_runtime${SMOKE_SUFFIX}.log"
+mkdir -p "$PROJECT_DIR/results"
+
+log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE"; }
+
+log "================ run_eval_two_models_single_l40 (generation-only) ================"
+log "LIMO_DIR    = $LIMO_DIR"
+log "OPENR1_DIR  = $OPENR1_DIR"
+log "EVAL_LIMIT  = ${EVAL_LIMIT:-<none>}"
+log "SKIP_MERGE  = $SKIP_MERGE"
+log "FORCE_RERUN = $FORCE_RERUN"
+
+# ---------- GPU 选择验证 ----------
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+if [[ "$CUDA_VISIBLE_DEVICES" == *,* ]]; then
+    echo "[ERROR] CUDA_VISIBLE_DEVICES='$CUDA_VISIBLE_DEVICES' 包含逗号，本实验只允许单卡。" >&2
+    exit 2
+fi
+GPU_INDEX="$CUDA_VISIBLE_DEVICES"
+log "GPU_INDEX = $GPU_INDEX"
+
+# ---------- 函数 ----------
 assert_gpu_free() {
     local who="$1"
-    log "检查目标 GPU (index=$CUDA_VISIBLE_DEVICES) 是否空闲 ($who) ..."
-    local procs
-    procs="$(nvidia-smi --id="$CUDA_VISIBLE_DEVICES" \
-               --query-compute-apps=pid,process_name,used_memory \
-               --format=csv,noheader 2>/dev/null || echo "")"
-    if [[ -n "$procs" ]]; then
-        log "[ERROR] 目标 GPU (index=$CUDA_VISIBLE_DEVICES) 上仍有进程:" >&2
-        echo "$procs" | tee -a "$ORCH_LOG" >&2
-        log "  不会自动 kill（可能属于其他用户）。请手动处理。" >&2
-        return 1
-    fi
-    log "  GPU 空闲，可以继续。"
-    return 0
+    local max_wait="${2:-30}"
+    local waited=0
+    log "[$who] 等待目标 GPU (index=$GPU_INDEX) 空闲 ..."
+    while (( waited < max_wait )); do
+        local procs
+        procs="$(nvidia-smi --id="$GPU_INDEX" \
+                   --query-compute-apps=pid,process_name,used_memory \
+                   --format=csv,noheader 2>/dev/null || echo "")"
+        if [[ -z "$procs" ]]; then
+            log "[$who] GPU 空闲。"
+            return 0
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+    log "[$who] [ERROR] 目标 GPU 不空闲:" >&2
+    nvidia-smi --id="$GPU_INDEX" \
+        --query-compute-apps=pid,process_name,used_memory \
+        --format=csv,noheader >&2 2>/dev/null || true
+    return 1
 }
 
 snapshot_gpu() {
-    local tag="$1"
-    local f="$PROJECT_DIR/nvidia_smi_${tag}.log"
-    nvidia-smi --id="$CUDA_VISIBLE_DEVICES" > "$f" 2>&1 || true
-    log "  nvidia-smi 快照 -> $f"
+    local who="$1"
+    log "[$who] GPU 快照:"
+    nvidia-smi --id="$GPU_INDEX" \
+        --query-gpu=name,memory.total,memory.used,utilization.gpu \
+        --format=csv 2>&1 | tee -a "$LOG_FILE" || true
 }
 
 merge_one() {
-    local adapter="$1" merged="$2" name="$3"
+    local adapter="$1"
+    local merged="$2"
+    local name="$3"
+
     if [[ "$SKIP_MERGE" == "1" ]]; then
-        log "[$name] SKIP_MERGE=1，跳过合并，直接复用 $merged"
+        log "[$name] SKIP_MERGE=1，跳过合并。"
+        if [[ ! -d "$merged" ]]; then
+            log "[$name] [ERROR] SKIP_MERGE=1 但 $merged 不存在" >&2
+            return 1
+        fi
         return 0
     fi
-    log "[$name] 合并 adapter -> BF16 merged model"
-    log "  adapter: $adapter"
-    log "  merged : $merged"
+
+    # 检查 merged model 是否已存在且完整
+    if [[ -d "$merged" ]]; then
+        local is_complete
+        is_complete="$(python - "$merged" <<'PY'
+import json, os, sys
+mdir = sys.argv[1]
+ok = os.path.isfile(os.path.join(mdir, "config.json"))
+# 检查 safetensors
+has_sf = any(f.endswith(".safetensors") for f in os.listdir(mdir)) if os.path.isdir(mdir) else False
+# 检查 tokenizer
+has_tok = any(os.path.isfile(os.path.join(mdir, t)) for t in ("tokenizer.json", "tokenizer.model", "spiece.model", "tokenizer_config.json"))
+# 检查 index
+idx = os.path.join(mdir, "model.safetensors.index.json")
+if os.path.isfile(idx):
+    try:
+        idx_data = json.loads(open(idx, encoding="utf-8").read())
+        shards = set(idx_data.get("weight_map", {}).values())
+        all_present = all(os.path.isfile(os.path.join(mdir, s)) for s in shards)
+    except Exception:
+        all_present = False
+else:
+    all_present = has_sf
+print("1" if (ok and has_sf and has_tok and all_present) else "0")
+PY
+)" || is_complete="0"
+        if [[ "$is_complete" == "1" ]]; then
+            log "[$name] merged model 已存在且完整，跳过合并。"
+            return 0
+        fi
+    fi
+
+    log "[$name] 合并 LoRA adapter -> BF16 ..."
     python scripts/merge_lora.py \
         --base_model "$BASE_MODEL" \
         --adapter_dir "$adapter" \
-        --out_dir "$merged"
-    log "[$name] 合并完成，等待进程退出 ..."
-    sleep 3
+        --out_dir "$merged" \
+        --overwrite 2>&1 | tee -a "$LOG_FILE"
+    return $?
 }
 
-# 从 manifest 中提取成功配置
+# eval_one: 评测单个模型，正确捕获返回码
+# 参数: model_path out_dir name force_config
+# 返回: 0=成功, 非0=失败
+eval_one() {
+    local model_path="$1"
+    local out_dir="$2"
+    local name="$3"
+    local force_config="${4:-}"
+    local rc=0
+
+    log "[$name] 开始评测 (force_config=${force_config:-<none>}) ..."
+
+    if [[ -n "$force_config" ]]; then
+        FORCE_CONFIG="$force_config" \
+            FORCE_RERUN="$FORCE_RERUN" \
+            EVAL_LIMIT="$EVAL_LIMIT" \
+            CUDA_VISIBLE_DEVICES="$GPU_INDEX" \
+            bash scripts/run_eval_single_l40_vllm.sh \
+            "$model_path" "$out_dir" "$name" 2>&1 | tee -a "$LOG_FILE" || rc=$?
+    else
+        FORCE_RERUN="$FORCE_RERUN" \
+            EVAL_LIMIT="$EVAL_LIMIT" \
+            CUDA_VISIBLE_DEVICES="$GPU_INDEX" \
+            bash scripts/run_eval_single_l40_vllm.sh \
+            "$model_path" "$out_dir" "$name" 2>&1 | tee -a "$LOG_FILE" || rc=$?
+    fi
+
+    if (( rc != 0 )); then
+        log "[$name] [ERROR] 评测失败，exit=$rc"
+        return "$rc"
+    fi
+
+    sleep 5
+    assert_gpu_free "$name post-eval" 30 || return 1
+    return 0
+}
+
+# 从 manifest 读取成功配置
 get_config_from_manifest() {
     local result_dir="$1"
-    local active_run="$result_dir/active_run.json"
-    if [[ ! -f "$active_run" ]]; then
+    local active_json="$result_dir/active_run.json"
+    if [[ ! -f "$active_json" ]]; then
         echo ""
-        return
+        return 1
     fi
-    python - "$result_dir" "$active_run" <<'PY'
-import json, os, sys
-result_dir, active_run_path = sys.argv[1], sys.argv[2]
+    local run_id
+    run_id="$(python - "$active_json" <<'PY'
+import json, sys
 try:
-    ar = json.load(open(active_run_path, encoding="utf-8"))
-    run_id = ar.get("active_run_id", "")
-    manifest_path = os.path.join(result_dir, "runs", run_id, "run_manifest.json")
-    m = json.load(open(manifest_path, encoding="utf-8"))
+    m = json.load(open(sys.argv[1], encoding="utf-8"))
+    print(m.get("active_run_id", ""))
+except Exception:
+    print("")
+PY
+)" || run_id=""
+    if [[ -z "$run_id" ]]; then
+        echo ""
+        return 1
+    fi
+    local manifest="$result_dir/runs/$run_id/run_manifest.json"
+    if [[ ! -f "$manifest" ]]; then
+        echo ""
+        return 1
+    fi
+    python - "$manifest" <<'PY'
+import json, sys
+try:
+    m = json.load(open(sys.argv[1], encoding="utf-8"))
+    level = m.get("fallback_level", 0)
     mnbt = m["max_num_batched_tokens"]
     mns = m["max_num_seqs"]
     gmu = m["gpu_memory_utilization"]
     pc = "True" if m["enable_prefix_caching"] else "False"
-    print(f"{mnbt} {mns} {gmu} {pc}")
+    print(f"{level} {mnbt} {mns} {gmu} {pc}")
 except Exception:
     print("")
 PY
 }
 
-# 比较两个配置，返回 0=相同，1=不同
+# 数值化比较两个配置是否一致（不比较字符串格式）
+# 参数: config1 config2
+# 输出: "equal" 或 "different"
 configs_equal() {
-    local c1="$1" c2="$2"
-    [[ "$c1" == "$c2" ]]
+    local c1="$1"
+    local c2="$2"
+    python - "$c1" "$c2" <<'PY'
+import sys
+c1 = sys.argv[1].split()
+c2 = sys.argv[2].split()
+if len(c1) != 5 or len(c2) != 5:
+    print("different")
+    sys.exit(0)
+# 逐字段比较（数值用 float 比较）
+try:
+    level1, mnbt1, mns1, gmu1, pc1 = c1
+    level2, mnbt2, mns2, gmu2, pc2 = c2
+    if (int(level1) == int(level2) and
+        int(mnbt1) == int(mnbt2) and
+        int(mns1) == int(mns2) and
+        abs(float(gmu1) - float(gmu2)) < 1e-6 and
+        pc1 == pc2):
+        print("equal")
+    else:
+        print("different")
+except (ValueError, IndexError):
+    print("different")
+PY
 }
 
-# 从配置字符串中提取 attempt 级别（数字越大越保守）
-# 8192/32/0.90/True=1, 4096/16/0.90/True=2, 2048/8/0.88/True=3, 2048/4/0.88/False=4
+# 判断 config1 是否比 config2 更保守（level 更大 = 更保守）
+# 输出: "more_conservative" / "less_conservative" / "equal"
 config_conservativeness() {
-    local cfg="$1"
-    case "$cfg" in
-        "8192 32 0.90 True")  echo 1 ;;
-        "4096 16 0.90 True")  echo 2 ;;
-        "2048 8  0.88 True")  echo 3 ;;
-        "2048 4  0.88 False") echo 4 ;;
-        *) echo 0 ;;
-    esac
+    local c1="$1"
+    local c2="$2"
+    python - "$c1" "$c2" <<'PY'
+import sys
+c1 = sys.argv[1].split()
+c2 = sys.argv[2].split()
+try:
+    l1 = int(c1[0])
+    l2 = int(c2[0])
+    if l1 > l2:
+        print("more_conservative")
+    elif l1 < l2:
+        print("less_conservative")
+    else:
+        print("equal")
+except (ValueError, IndexError):
+    print("equal")
+PY
 }
 
-eval_one() {
-    local model_path="$1" out_dir="$2" name="$3" force_config="${4:-}"
-    log "[$name] 启动 vLLM 评测"
-    log "  model_path: $model_path"
-    log "  out_dir   : $out_dir"
-    if [[ -n "$force_config" ]]; then
-        log "  force_config: $force_config"
-        FORCE_CONFIG="$force_config" \
-        bash scripts/run_eval_single_l40_vllm.sh "$model_path" "$out_dir" "$name"
-    else
-        bash scripts/run_eval_single_l40_vllm.sh "$model_path" "$out_dir" "$name"
-    fi
-    local rc=$?
-    if [[ $rc -ne 0 ]]; then
-        log "[ERROR] [$name] 评测失败 (exit=$rc)" >&2
-        return $rc
-    fi
-    log "[$name] 评测进程已结束，等待 GPU 释放 ..."
-    sleep 5
-    assert_gpu_free "$name" || return 1
-    snapshot_gpu "after_${name}"
-    return 0
-}
+# ---------- 主流程 ----------
 
-# ---------- 1. 初始 GPU 空闲检查 ----------
-assert_gpu_free "orchestrator start" || exit 10
+# 1. 初始 GPU 空闲检查
+assert_gpu_free "initial" 30 || exit 1
+snapshot_gpu "initial"
 
-# ---------- 2. LIMO 评测 ----------
-START_TOTAL="$(date +%s)"
+# 2. 合并/验证 LIMO
+merge_one "$LIMO_ADAPTER" "$LIMO_MERGED" "LIMO-817" || exit 2
 
-merge_one "$LIMO_ADAPTER" "$LIMO_MERGED" "LIMO-817"
-assert_gpu_free "LIMO merge done" || exit 10
+# 3. 评测 LIMO
+log "================ 评测 LIMO-817 ================"
+eval_one "$LIMO_MERGED" "$LIMO_DIR" "LIMO-817" "" || exit 10
 
-# LIMO 使用正常 fallback 找到成功配置
-eval_one "$LIMO_MERGED" "$LIMO_DIR" "LIMO-817" "" || exit 20
-
-# 读取 LIMO 的成功配置
+# 读取 LIMO 成功配置
 LIMO_CONFIG="$(get_config_from_manifest "$LIMO_DIR")"
-log "LIMO-817 成功配置: $LIMO_CONFIG"
+log "LIMO 成功配置: $LIMO_CONFIG"
+
 if [[ -z "$LIMO_CONFIG" ]]; then
-    log "[ERROR] 无法从 LIMO manifest 中读取成功配置" >&2
-    exit 20
+    log "[ERROR] 无法读取 LIMO 成功配置" >&2
+    exit 10
 fi
 
-# ---------- 3. OpenR1 评测（使用 LIMO 的配置） ----------
-merge_one "$OPENR1_ADAPTER" "$OPENR1_MERGED" "OpenR1-10K"
-assert_gpu_free "OpenR1 merge done" || exit 30
+# 4. 合并/验证 OpenR1
+assert_gpu_free "before OpenR1 merge" 30 || exit 1
+merge_one "$OPENR1_ADAPTER" "$OPENR1_MERGED" "OpenR1-10K" || exit 2
 
-# OpenR1 首先尝试 LIMO 的配置（FORCE_CONFIG），不走 fallback
-log "OpenR1-10K 使用 LIMO 的成功配置: $LIMO_CONFIG"
-eval_one "$OPENR1_MERGED" "$OPENR1_DIR" "OpenR1-10K" "$LIMO_CONFIG"
-OPENR1_RC=$?
+# 5. 评测 OpenR1（使用 LIMO 的配置）
+log "================ 评测 OpenR1-10K (使用 LIMO 配置) ================"
 
-if [[ $OPENR1_RC -ne 0 ]]; then
-    log "OpenR1-10K 使用 LIMO 配置失败，走正常 fallback 重新评测 ..."
-    assert_gpu_free "OpenR1 fallback retry" || exit 30
-    FORCE_RERUN=1 eval_one "$OPENR1_MERGED" "$OPENR1_DIR" "OpenR1-10K" "" || exit 40
-fi
+OPENR1_RC=0
 
-# 读取 OpenR1 的成功配置
-OPENR1_CONFIG="$(get_config_from_manifest "$OPENR1_DIR")"
-log "OpenR1-10K 成功配置: $OPENR1_CONFIG"
-if [[ -z "$OPENR1_CONFIG" ]]; then
-    log "[ERROR] 无法从 OpenR1 manifest 中读取成功配置" >&2
-    exit 40
-fi
-
-# ---------- 4. 配置一致性检查 ----------
-log "配置一致性检查 ..."
-log "  LIMO  配置: $LIMO_CONFIG"
-log "  OpenR1 配置: $OPENR1_CONFIG"
-
-THROUGHPUT_COMPARABLE="true"
-if ! configs_equal "$LIMO_CONFIG" "$OPENR1_CONFIG"; then
-    log "[WARN] 两模型配置不一致！"
-    # 找出更保守的配置
-    LIMO_CONS=$(config_conservativeness "$LIMO_CONFIG")
-    OPENR1_CONS=$(config_conservativeness "$OPENR1_CONFIG")
-    log "  LIMO conservativeness level: $LIMO_CONS"
-    log "  OpenR1 conservativeness level: $OPENR1_CONS"
-
-    if (( OPENR1_CONS > LIMO_CONS )); then
-        # OpenR1 更保守，用 OpenR1 的配置重跑 LIMO
-        log "  OpenR1 配置更保守，使用 OpenR1 配置重跑 LIMO ..."
-        assert_gpu_free "LIMO rerun" || exit 50
-        FORCE_RERUN=1 eval_one "$LIMO_MERGED" "$LIMO_DIR" "LIMO-817-rerun" "$OPENR1_CONFIG" || exit 50
-        LIMO_CONFIG="$(get_config_from_manifest "$LIMO_DIR")"
-        log "  LIMO 重跑后配置: $LIMO_CONFIG"
-    elif (( LIMO_CONS > OPENR1_CONS )); then
-        # LIMO 更保守，用 LIMO 的配置重跑 OpenR1
-        log "  LIMO 配置更保守，使用 LIMO 配置重跑 OpenR1 ..."
-        assert_gpu_free "OpenR1 rerun" || exit 50
-        FORCE_RERUN=1 eval_one "$OPENR1_MERGED" "$OPENR1_DIR" "OpenR1-10K-rerun" "$LIMO_CONFIG" || exit 50
-        OPENR1_CONFIG="$(get_config_from_manifest "$OPENR1_DIR")"
-        log "  OpenR1 重跑后配置: $OPENR1_CONFIG"
-    fi
-
-    # 最终检查
-    if ! configs_equal "$LIMO_CONFIG" "$OPENR1_CONFIG"; then
-        log "[WARN] 重跑后配置仍不一致，throughput 不可比较"
-        THROUGHPUT_COMPARABLE="false"
-    else
-        log "重跑后配置一致，throughput 可比较"
-    fi
+# 使用 `|| rc=$?` 模式捕获返回码，不触发 set -e
+if eval_one "$OPENR1_MERGED" "$OPENR1_DIR" "OpenR1-10K" "$LIMO_CONFIG"; then
+    OPENR1_RC=0
 else
-    log "  两模型配置一致，throughput 可比较"
+    OPENR1_RC=$?
 fi
 
-END_TOTAL="$(date +%s)"
-log "两模型评测全部完成，总耗时 $((END_TOTAL - START_TOTAL))s"
+if (( OPENR1_RC != 0 )); then
+    log "OpenR1 使用 LIMO 配置失败 (rc=$OPENR1_RC)，开始正常 fallback。"
 
-# ---------- 5. 汇总对比 ----------
-log "生成对比汇总 ..."
-python scripts/summarize_eval_efficiency.py \
-    --limo_dir "$LIMO_DIR" \
-    --openr1_dir "$OPENR1_DIR" \
-    --out_json "$PROJECT_DIR/results/comparison_math500_aime24_aime25_32k.json" \
-    --out_csv "$PROJECT_DIR/results/comparison_math500_aime24_aime25_32k.csv" \
-    --out_md "$PROJECT_DIR/results/comparison_math500_aime24_aime25_32k.md" \
-    --throughput_comparable "$THROUGHPUT_COMPARABLE" \
-    2>&1 | tee -a "$ORCH_LOG" || log "[WARN] 汇总生成失败。"
+    # 确认 GPU 空闲后重试
+    assert_gpu_free "before OpenR1 fallback" 30 || {
+        log "[ERROR] OpenR1 fallback 前目标 GPU 不空闲" >&2
+        exit 40
+    }
 
-log "对比结果:"
-log "  results/comparison_math500_aime24_aime25_32k.json"
-log "  results/comparison_math500_aime24_aime25_32k.csv"
-log "  results/comparison_math500_aime24_aime25_32k.md"
-log "  throughput_comparable: $THROUGHPUT_COMPARABLE"
-log "================ 全部完成 ================"
+    # 使用 FORCE_RERUN=1 重跑 OpenR1（不传 force_config，走正常 fallback）
+    if ! FORCE_RERUN=1 eval_one "$OPENR1_MERGED" "$OPENR1_DIR" "OpenR1-10K" ""; then
+        log "[ERROR] OpenR1 fallback 也失败" >&2
+        exit 40
+    fi
+
+    # OpenR1 fallback 成功，检查新配置是否与 LIMO 一致
+    OPENR1_CONFIG="$(get_config_from_manifest "$OPENR1_DIR")"
+    log "OpenR1 fallback 成功配置: $OPENR1_CONFIG"
+
+    CMP_RESULT="$(configs_equal "$LIMO_CONFIG" "$OPENR1_CONFIG")"
+    if [[ "$CMP_RESULT" != "equal" ]]; then
+        log "OpenR1 使用了更保守的配置，需要用相同配置重跑 LIMO。"
+        log "  LIMO config:   $LIMO_CONFIG"
+        log "  OpenR1 config: $OPENR1_CONFIG"
+
+        # 用 OpenR1 的配置重跑 LIMO
+        assert_gpu_free "before LIMO rerun" 30 || exit 1
+        if ! FORCE_RERUN=1 eval_one "$LIMO_MERGED" "$LIMO_DIR" "LIMO-817" "$OPENR1_CONFIG"; then
+            log "[ERROR] LIMO 使用新配置重跑失败" >&2
+            exit 41
+        fi
+
+        # 更新 LIMO_CONFIG
+        LIMO_CONFIG="$(get_config_from_manifest "$LIMO_DIR")"
+        log "LIMO 重跑后配置: $LIMO_CONFIG"
+    fi
+fi
+
+# 6. 最终配置比较
+log "================ 最终配置比较 ================"
+log "LIMO config:   $LIMO_CONFIG"
+OPENR1_CONFIG="$(get_config_from_manifest "$OPENR1_DIR")"
+log "OpenR1 config: $OPENR1_CONFIG"
+
+FINAL_CMP="$(configs_equal "$LIMO_CONFIG" "$OPENR1_CONFIG")"
+if [[ "$FINAL_CMP" == "equal" ]]; then
+    log "两模型最终配置一致，throughput_comparable=true"
+    THROUGHPUT_COMPARABLE="true"
+else
+    log "两模型最终配置不一致，throughput_comparable=false" >&2
+    THROUGHPUT_COMPARABLE="false"
+fi
+
+# 7. 汇总
+log "================ 汇总效率统计 ================"
+EFF_PY="$PROJECT_DIR/scripts/summarize_eval_efficiency.py"
+if [[ -f "$EFF_PY" ]]; then
+    if [[ -n "$EVAL_LIMIT" ]]; then
+        python "$EFF_PY" \
+            --limo_dir "$LIMO_DIR" \
+            --openr1_dir "$OPENR1_DIR" \
+            --out_json "$PROJECT_DIR/results/generation_comparison_32k${SMOKE_SUFFIX}.json" \
+            --out_csv "$PROJECT_DIR/results/generation_comparison_32k${SMOKE_SUFFIX}.csv" \
+            --out_md "$PROJECT_DIR/results/generation_comparison_32k${SMOKE_SUFFIX}.md" \
+            --smoke 1 \
+            2>&1 | tee -a "$LOG_FILE" || log "[WARN] 汇总失败。"
+    else
+        python "$EFF_PY" \
+            --limo_dir "$LIMO_DIR" \
+            --openr1_dir "$OPENR1_DIR" \
+            --out_json "$PROJECT_DIR/results/generation_comparison_32k_full.json" \
+            --out_csv "$PROJECT_DIR/results/generation_comparison_32k_full.csv" \
+            --out_md "$PROJECT_DIR/results/generation_comparison_32k_full.md" \
+            2>&1 | tee -a "$LOG_FILE" || log "[WARN] 汇总失败。"
+    fi
+fi
+
+# 8. 最终 GPU 空闲确认
+assert_gpu_free "final" 30 || {
+    log "[WARN] 最终 GPU 检查未通过，可能有残留进程。" >&2
+}
+
+log "================ 两模型串行评测完成 (generation-only) ================"
+log "LIMO 结果:   $LIMO_DIR"
+log "OpenR1 结果: $OPENR1_DIR"
+log "比较结果:    results/generation_comparison_32k${SMOKE_SUFFIX:-_full}.*"
+log "throughput_comparable: $THROUGHPUT_COMPARABLE"
 exit 0

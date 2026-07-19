@@ -1,7 +1,13 @@
 #!/bin/bash
 # run_eval_single_l40_vllm.sh
-# 单模型 vLLM 评测：在单卡 L40 上用 lm-evaluation-harness 的 vLLM backend
-# 评测 MATH500 + AIME24 + AIME25，最大生成长度 32768 tokens。
+# 单模型 vLLM 生成（generation-only）：在单卡 L40 上用 lm-evaluation-harness 的 vLLM backend
+# 为 MATH500 + AIME24 + AIME25 生成模型输出，最大生成长度 32768 tokens。
+#
+# 本轮为 generation-only 模式：
+#   * 使用 --predict_only，不依赖服务器端 exact_match 判分；
+#   * 完成度判定不要求 accuracy，只检查输出完整性；
+#   * 每个 task 独立调用 lm-eval（task 级断点恢复）；
+#   * 导出统一 JSONL 供本地独立判分。
 #
 # 用法:
 #   bash scripts/run_eval_single_l40_vllm.sh MODEL_PATH OUTPUT_DIR RUN_NAME
@@ -10,15 +16,8 @@
 #   CUDA_VISIBLE_DEVICES      默认 0（只接受单卡，含逗号则报错）
 #   EVAL_LIMIT                smoke test：每个 task 只跑前 N 条（如 2）
 #   FORCE_RERUN=1             强制重跑，新建 run_id，不删除历史
+#   FORCE_CONFIG              如 "2 4096 16 0.90 True"（level mnbt mns gmu epc），跳过 fallback
 #   MAX_MODEL_LEN             默认 40960（含输入+输出，必须 >= max_gen_toks）
-#
-# 设计原则:
-#   * 两个模型必须使用完全相同的 backend/prompt/task/生成参数；
-#   * max_gen_toks 固定 32768，OOM fallback 绝不降低它，也不更换 task/prompt；
-#   * fallback 4 次尝试，非 OOM 错误立即停止；
-#   * cleanup 使用 trap，不残留进程，不 pkill 其他用户进程；
-#   * attempt=0 在循环前初始化（set -u 兼容）；
-#   * 结果使用 active_run.json + runs/<run_id>/ 结构，FORCE_RERUN 不覆盖历史。
 
 set -euo pipefail
 
@@ -37,14 +36,13 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 if [[ "$CUDA_VISIBLE_DEVICES" == *,* ]]; then
     echo "[ERROR] CUDA_VISIBLE_DEVICES='$CUDA_VISIBLE_DEVICES' 包含逗号，本实验只允许单卡。" >&2
-    echo "  只接受 CUDA_VISIBLE_DEVICES=0（或单张物理卡索引）。" >&2
     exit 2
 fi
 
 GPU_INDEX="$CUDA_VISIBLE_DEVICES"
 
 # ---------- 固定参数 ----------
-TASKS="${TASKS:-local_math500_32k,local_aime24_32k,local_aime25_32k}"
+ALL_TASKS=("local_math500_32k" "local_aime24_32k" "local_aime25_32k")
 MAX_GEN_TOKS=32768
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-40960}"
 FORCE_RERUN="${FORCE_RERUN:-0}"
@@ -73,12 +71,11 @@ SUCCESS_MNBT=0
 SUCCESS_MNS=0
 SUCCESS_GMU=""
 SUCCESS_PC=""
-START_EPOCH=""
-END_EPOCH=""
-ELAPSED=0
+SUCCESS_LEVEL=0
 GPU_NAME=""
 GPU_UUID=""
 GPU_TOTAL_MEM=""
+GPU_PEAK_MIB=0
 
 # ---------- cleanup 函数 ----------
 cleanup() {
@@ -108,22 +105,24 @@ PROMPT_CHECK_JSON="$RUN_DIR/prompt_length_check.json"
 
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$RUNTIME_LOG"; }
 
-log "================ run_eval_single_l40_vllm ================"
+log "================ run_eval_single_l40_vllm (generation-only) ================"
 log "RUN_NAME            = $RUN_NAME"
 log "MODEL_PATH          = $MODEL_PATH"
 log "OUTPUT_DIR          = $OUTPUT_DIR"
 log "RUN_ID              = $RUN_ID"
 log "RUN_DIR             = $RUN_DIR"
 log "CUDA_VISIBLE_DEVICES= $CUDA_VISIBLE_DEVICES"
-log "TASKS               = $TASKS"
+log "TASKS               = ${ALL_TASKS[*]}"
 log "MAX_GEN_TOKS        = $MAX_GEN_TOKS"
 log "MAX_MODEL_LEN       = $MAX_MODEL_LEN"
 log "EVAL_LIMIT          = ${EVAL_LIMIT:-<none>}"
 log "FORCE_RERUN         = $FORCE_RERUN"
+log "FORCE_CONFIG        = ${FORCE_CONFIG:-<none>}"
 log "LM_EVAL_CMD         = $LM_EVAL_CMD"
+log "predict_only        = true"
+log "evaluation_mode     = generation_only"
 
 # ---------- 1. 检查已有完整结果 ----------
-# active_run.json 结构: {"active_run_id": "run_...", "status": "complete"}
 if [[ -f "$ACTIVE_RUN_JSON" ]]; then
     ACTIVE_STATUS=""
     ACTIVE_RUN_ID=""
@@ -195,7 +194,7 @@ TASK_LISTING="$($LM_EVAL_CMD --tasks list --include_path "$PROJECT_DIR/eval_task
     exit 4
 }
 
-for t in $(echo "$TASKS" | tr ',' ' '); do
+for t in "${ALL_TASKS[@]}"; do
     if ! echo "$TASK_LISTING" | grep -qE "(^|[[:space:]])${t}([[:space:]]|$)"; then
         log "[ERROR] task '$t' 在当前 lm_eval ($LM_EVAL_VERSION) 中不存在。" >&2
         log "  include_path: $PROJECT_DIR/eval_tasks" >&2
@@ -206,58 +205,100 @@ for t in $(echo "$TASKS" | tr ',' ' '); do
     log "  task OK: $t"
 done
 
-# ---------- 4. prompt 长度预检 ----------
+# ---------- 4. 动态加载数据集获取预期样本数 ----------
+log "动态加载数据集获取预期样本数 ..."
+EXPECTED_COUNTS_JSON="$(python - "$EVAL_LIMIT" <<'PY'
+import json, sys, os
+eval_limit = sys.argv[1] if len(sys.argv) > 1 else ""
+# 尝试加载三个数据集获取真实 split 长度
+counts = {}
+dataset_configs = [
+    ("local_math500_32k", "HuggingFaceH4/MATH-500", "default", "test"),
+    ("local_aime24_32k", "Maxwell-Jia/AIME_2024", None, "train"),
+    ("local_aime25_32k", "math-ai/aime25", None, "test"),
+]
+try:
+    from datasets import load_dataset
+    for task, ds_path, config, split in dataset_configs:
+        try:
+            if config:
+                ds = load_dataset(ds_path, config, split=split)
+            else:
+                ds = load_dataset(ds_path, split=split)
+            n = len(ds)
+            if eval_limit and eval_limit.strip():
+                n = min(int(eval_limit), n)
+            counts[task] = n
+            print(f"[counts] {task}: {n}", file=sys.stderr)
+        except Exception as e:
+            # 回退到已知数量
+            fallback = {"local_math500_32k": 500, "local_aime24_32k": 30, "local_aime25_32k": 30}
+            n = fallback.get(task, 0)
+            if eval_limit and eval_limit.strip():
+                n = min(int(eval_limit), n)
+            counts[task] = n
+            print(f"[counts] {task}: {n} (fallback, load failed: {e})", file=sys.stderr)
+except ImportError:
+    fallback = {"local_math500_32k": 500, "local_aime24_32k": 30, "local_aime25_32k": 30}
+    for task, n in fallback.items():
+        if eval_limit and eval_limit.strip():
+            n = min(int(eval_limit), n)
+        counts[task] = n
+        print(f"[counts] {task}: {n} (fallback, datasets not installed)", file=sys.stderr)
+print(json.dumps(counts))
+PY
+)" || {
+    log "[ERROR] 无法获取数据集预期样本数" >&2
+    exit 5
+}
+log "预期样本数: $EXPECTED_COUNTS_JSON"
+
+# ---------- 5. prompt 长度预检 ----------
 LIMIT_ARG=""
+LIMIT_ARGS=()
 if [[ -n "$EVAL_LIMIT" ]]; then
     LIMIT_ARG="--limit $EVAL_LIMIT"
+    LIMIT_ARGS=("--limit" "$EVAL_LIMIT")
 fi
 
+TASKS_STR="$(IFS=,; echo "${ALL_TASKS[*]}")"
 log "prompt 长度预检 (max_prompt_tokens + $MAX_GEN_TOKS <= $MAX_MODEL_LEN) ..."
 python scripts/check_prompt_lengths.py \
     --model_path "$MODEL_PATH" \
-    --tasks "$TASKS" \
+    --tasks "$TASKS_STR" \
     --max_gen_toks "$MAX_GEN_TOKS" \
     --max_model_len "$MAX_MODEL_LEN" \
-    ${LIMIT_ARG} \
+    "${LIMIT_ARGS[@]}" \
     --out "$PROMPT_CHECK_JSON" 2>&1 | tee -a "$RUNTIME_LOG" || {
     log "[ERROR] prompt 长度预检失败。拒绝截断 prompt / 降低 max_gen_toks。请增大 MAX_MODEL_LEN（如 49152）。" >&2
     exit 5
 }
 
-# ---------- 5. GPU 峰值监控（后台，仅采样目标卡） ----------
-log "启动 GPU 监控 (target index=$GPU_INDEX, log -> $GPU_LOG) ..."
-(
-    while true; do
-        nvidia-smi \
-            --id="$GPU_INDEX" \
-            --query-gpu=timestamp,memory.used,memory.total,utilization.gpu \
-            --format=csv,noheader 2>&1 || true
-        sleep 5
-    done
-) > "$GPU_LOG" 2>&1 &
-GPU_MONITOR_PID=$!
-log "GPU monitor pid = $GPU_MONITOR_PID"
+# ---------- 6. GPU 监控函数 ----------
+start_gpu_monitor() {
+    log "启动 GPU 监控 (target index=$GPU_INDEX, log -> $GPU_LOG) ..."
+    (
+        while true; do
+            nvidia-smi \
+                --id="$GPU_INDEX" \
+                --query-gpu=timestamp,memory.used,memory.total,utilization.gpu \
+                --format=csv,noheader,nounits 2>&1 || true
+            sleep 5
+        done
+    ) > "$GPU_LOG" 2>&1 &
+    GPU_MONITOR_PID=$!
+    log "GPU monitor pid = $GPU_MONITOR_PID"
+}
 
-# ---------- 6. OOM fallback 配置表 ----------
-# 4 次尝试，max_gen_toks 始终 32768，max_model_len 始终不变，task/prompt 不变。
-# 每行: max_num_batched_tokens max_num_seqs gpu_memory_utilization enable_prefix_caching
-FALLBACK_CONFIGS=(
-    "8192 32 0.90 True"
-    "4096 16 0.90 True"
-    "2048 8  0.88 True"
-    "2048 4  0.88 False"
-)
+stop_gpu_monitor() {
+    if [[ -n "${GPU_MONITOR_PID:-}" ]]; then
+        kill "$GPU_MONITOR_PID" 2>/dev/null || true
+        wait "$GPU_MONITOR_PID" 2>/dev/null || true
+        GPU_MONITOR_PID=""
+    fi
+}
 
-# 如果 FORCE_CONFIG 被设置（如 "4096 16 0.90 True"），则只用该配置，不走 fallback。
-# 用于两模型共同配置机制：OpenR1 必须使用与 LIMO 相同的配置。
-if [[ -n "${FORCE_CONFIG:-}" ]]; then
-    FALLBACK_CONFIGS=("$FORCE_CONFIG")
-    log "FORCE_CONFIG 已设置: $FORCE_CONFIG（跳过 fallback，只用该配置）"
-fi
-
-MAX_ATTEMPTS=${#FALLBACK_CONFIGS[@]}
-
-# ---------- 7. 等待 GPU 空闲并验证显存释放 ----------
+# ---------- 7. 等待 GPU 空闲 ----------
 wait_gpu_free() {
     local who="$1"
     local max_wait="${2:-30}"
@@ -282,154 +323,298 @@ wait_gpu_free() {
     return 1
 }
 
-# ---------- 8. 串行尝试各配置 ----------
-START_EPOCH="$(date +%s)"
-START_ISO="$(date '+%F %T %z')"
+# ---------- 8. GPU 峰值解析 ----------
+parse_gpu_peak() {
+    local peak=0
+    if [[ -f "$GPU_LOG" ]]; then
+        peak="$(python - "$GPU_LOG" <<'PY'
+import sys
+peak = 0
+for line in open(sys.argv[1], encoding="utf-8", errors="ignore"):
+    parts = [p.strip() for p in line.split(",")]
+    if len(parts) >= 2:
+        try:
+            val = int(float(parts[1]))
+            if val > peak:
+                peak = val
+        except (ValueError, TypeError):
+            pass
+print(peak)
+PY
+)" || peak=0
+    fi
+    echo "$peak"
+}
 
-for cfg in "${FALLBACK_CONFIGS[@]}"; do
-    read -r mnbt mns gmu epc <<< "$cfg"
-    attempt=$((attempt + 1))
-    attempt_dir="$RUN_DIR/attempts/attempt_${attempt}"
-    attempt_log="$RUN_DIR/attempt_${attempt}.log"
-    lm_eval_output="$attempt_dir/lm_eval_output"
-    mkdir -p "$lm_eval_output"
+# ---------- 9. OOM fallback 配置表 ----------
+# 每行: level mnbt mns gmu epc
+# level 1=最激进, 4=最保守
+FALLBACK_CONFIGS=(
+    "1 8192 32 0.90 True"
+    "2 4096 16 0.90 True"
+    "3 2048 8  0.88 True"
+    "4 2048 4  0.88 False"
+)
 
-    if [[ "$epc" == "True" ]]; then prefix_caching="True"; else prefix_caching="False"; fi
+if [[ -n "${FORCE_CONFIG:-}" ]]; then
+    FALLBACK_CONFIGS=("$FORCE_CONFIG")
+    log "FORCE_CONFIG 已设置: $FORCE_CONFIG（跳过 fallback，只用该配置）"
+fi
 
-    MODEL_ARGS="pretrained=${MODEL_PATH},dtype=bfloat16,tensor_parallel_size=1,gpu_memory_utilization=${gmu},max_model_len=${MAX_MODEL_LEN},max_num_batched_tokens=${mnbt},max_num_seqs=${mns},enable_prefix_caching=${prefix_caching},trust_remote_code=True"
-    GEN_KWARGS="do_sample=False,temperature=0.0,max_gen_toks=${MAX_GEN_TOKS}"
+MAX_ATTEMPTS=${#FALLBACK_CONFIGS[@]}
 
-    log "---- attempt $attempt / $MAX_ATTEMPTS ----"
-    log "  max_num_batched_tokens = $mnbt"
-    log "  max_num_seqs           = $mns"
-    log "  gpu_memory_utilization = $gmu"
-    log "  enable_prefix_caching  = $prefix_caching"
-    log "  max_gen_toks           = $MAX_GEN_TOKS (固定，不降低)"
-    log "  max_model_len          = $MAX_MODEL_LEN (固定，不降低)"
-    log "  model_args             = $MODEL_ARGS"
-    log "  gen_kwargs             = $GEN_KWARGS"
-    log "  output_path            = $lm_eval_output"
+# ---------- 10. 第一次 attempt 前检查 GPU 空闲 ----------
+wait_gpu_free "before first attempt" 30 || {
+    log "[ERROR] 首次 attempt 前目标 GPU 不空闲" >&2
+    exit 7
+}
 
-    # 启动前确认 GPU 空闲（第一次 attempt 不检查，后续检查前一次已退出）
-    if (( attempt > 1 )); then
-        wait_gpu_free "attempt $attempt" 30 || exit 7
+# ---------- 11. 启动 GPU 监控 ----------
+start_gpu_monitor
+
+# ---------- 12. 运行单个 task 的 fallback 循环 ----------
+# 参数: task_name force_config_str
+# 返回: 0=成功, 非0=失败
+run_task() {
+    local task="$1"
+    local task_force_config="${2:-}"
+    local task_dir="$RUN_DIR/tasks/$task"
+    local task_manifest="$task_dir/task_manifest.json"
+    local task_log="$task_dir/runtime.log"
+    mkdir -p "$task_dir"
+
+    log "================ task: $task ================"
+    log "  task_dir = $task_dir"
+
+    # 如果 FORCE_RERUN 未设置，检查 task 是否已完成（断点恢复）
+    if [[ "$FORCE_RERUN" != "1" && -f "$task_manifest" ]]; then
+        local task_status
+        task_status="$(python - "$task_manifest" <<'PY'
+import json, sys
+try:
+    m = json.load(open(sys.argv[1], encoding="utf-8"))
+    print(m.get("status", ""))
+except Exception:
+    print("")
+PY
+)" || task_status=""
+        if [[ "$task_status" == "complete" ]]; then
+            log "[skip] task $task 已完成（断点恢复），跳过。"
+            return 0
+        fi
     fi
 
-    # 运行 lm-eval（后台运行以便 cleanup 能 kill）
-    set +e
-    $LM_EVAL_CMD \
-        --model vllm \
-        --model_args "$MODEL_ARGS" \
-        --tasks "$TASKS" \
-        --include_path "$PROJECT_DIR/eval_tasks" \
-        --batch_size auto \
-        --gen_kwargs "$GEN_KWARGS" \
-        --output_path "$lm_eval_output" \
-        --log_samples \
-        ${LIMIT_ARG} \
-        > "$attempt_log" 2>&1 &
-    EVAL_CHILD_PID=$!
-    wait "$EVAL_CHILD_PID"
-    rc=$?
-    EVAL_CHILD_PID=""
-    set -e
-
-    log "  attempt $attempt exit code = $rc"
-
-    if (( rc == 0 )); then
-        SUCCESS=1
-        SUCCESS_ATTEMPT=$attempt
-        SUCCESS_MNBT=$mnbt
-        SUCCESS_MNS=$mns
-        SUCCESS_GMU="$gmu"
-        SUCCESS_PC="$prefix_caching"
-        break
-    fi
-
-    # 判断是否 OOM
-    if grep -qiE "out of memory|OutOfMemoryError|CUDA error|HBM out of memory|torch\.cuda\.OutOfMemoryError" "$attempt_log"; then
-        log "  检测到 OOM，按 fallback 策略降低调度参数后重试。"
-        # 等待前一个 vLLM 进程完全退出
-        wait_gpu_free "OOM recovery" 30 || {
-            log "[ERROR] OOM 后 GPU 显存未释放，停止重试。" >&2
-            break
-        }
-        continue
+    # 确定 fallback 配置
+    local task_configs=()
+    if [[ -n "$task_force_config" ]]; then
+        task_configs=("$task_force_config")
     else
-        log "  非 OOM 错误，停止重试。详见 $attempt_log" >&2
-        log "  错误摘要（最后 20 行）:" >&2
-        tail -20 "$attempt_log" >&2 || true
-        break
+        task_configs=("${FALLBACK_CONFIGS[@]}")
     fi
-done
 
-END_EPOCH="$(date +%s)"
-END_ISO="$(date '+%F %T %z')"
-ELAPSED=$((END_EPOCH - START_EPOCH))
+    local task_attempt=0
+    local task_success=0
+    local task_success_attempt=0
+    local task_success_mnbt=0
+    local task_success_mns=0
+    local task_success_gmu=""
+    local task_success_pc=""
+    local task_success_level=0
+    local task_success_elapsed=0
+    local task_attempts_json="[]"
 
-# 停掉 GPU 监控
-if [[ -n "$GPU_MONITOR_PID" ]]; then
-    kill "$GPU_MONITOR_PID" 2>/dev/null || true
-    wait "$GPU_MONITOR_PID" 2>/dev/null || true
-    GPU_MONITOR_PID=""
-fi
+    for cfg in "${task_configs[@]}"; do
+        read -r level mnbt mns gmu epc <<< "$cfg"
+        task_attempt=$((task_attempt + 1))
+        local attempt_dir="$task_dir/attempts/attempt_${task_attempt}"
+        local attempt_log="$task_dir/attempt_${task_attempt}.log"
+        local lm_eval_output="$attempt_dir/lm_eval_output"
+        mkdir -p "$lm_eval_output"
 
-if (( SUCCESS != 1 )); then
-    log "[ERROR] 所有 fallback 配置均失败（或遇到非 OOM 错误）。max_gen_toks 始终为 32768，未降低。" >&2
-    exit 6
-fi
+        if [[ "$epc" == "True" ]]; then prefix_caching="True"; else prefix_caching="False"; fi
 
-log "评测成功。成功 attempt=$SUCCESS_ATTEMPT, max_num_batched_tokens=$SUCCESS_MNBT, max_num_seqs=$SUCCESS_MNS"
-log "总耗时: ${ELAPSED}s"
+        local model_args="pretrained=${MODEL_PATH},dtype=bfloat16,tensor_parallel_size=1,gpu_memory_utilization=${gmu},max_model_len=${MAX_MODEL_LEN},max_num_batched_tokens=${mnbt},max_num_seqs=${mns},enable_prefix_caching=${prefix_caching},trust_remote_code=True"
+        local gen_kwargs="do_sample=False,temperature=0.0,max_gen_toks=${MAX_GEN_TOKS}"
 
-# ---------- 9. 完成度判定 + 写 manifest ----------
-SUCCESS_ATTEMPT_DIR="$RUN_DIR/attempts/attempt_${SUCCESS_ATTEMPT}"
-SUCCESS_LM_EVAL_OUTPUT="$SUCCESS_ATTEMPT_DIR/lm_eval_output"
+        log "---- task=$task attempt $task_attempt / ${#task_configs[@]} ----"
+        log "  fallback_level          = $level"
+        log "  max_num_batched_tokens  = $mnbt"
+        log "  max_num_seqs            = $mns"
+        log "  gpu_memory_utilization  = $gmu"
+        log "  enable_prefix_caching   = $prefix_caching"
+        log "  max_gen_toks            = $MAX_GEN_TOKS (固定)"
+        log "  max_model_len           = $MAX_MODEL_LEN (固定)"
+        log "  predict_only            = true"
+        log "  output_path             = $lm_eval_output"
 
-log "执行 12 条完成度判定 ..."
-python - \
-    "$MANIFEST" \
-    "$SUCCESS_LM_EVAL_OUTPUT" \
-    "$TASKS" \
-    "$MAX_GEN_TOKS" \
-    "$MAX_MODEL_LEN" \
-    "$SUCCESS_MNBT" \
-    "$SUCCESS_MNS" \
-    "$SUCCESS_GMU" \
-    "$SUCCESS_PC" \
-    "$MODEL_PATH" \
-    "$RUN_NAME" \
-    "$RUN_ID" \
-    "$START_ISO" \
-    "$END_ISO" \
-    "$ELAPSED" \
-    "$GPU_NAME" \
-    "$GPU_UUID" \
-    "$GPU_TOTAL_MEM" \
-    "$GPU_INDEX" \
-    "$LM_EVAL_VERSION" \
-    "$EVAL_LIMIT" \
-    "$SUCCESS_ATTEMPT" \
-    <<'PYEOF'
-import json, os, sys, glob, subprocess
-from importlib.metadata import version, PackageNotFoundError
+        # attempt 前确认 GPU 空闲
+        if (( task_attempt > 1 )); then
+            wait_gpu_free "task=$task attempt $task_attempt" 30 || {
+                log "[ERROR] task=$task attempt $task_attempt 前 GPU 不空闲" >&2
+                return 7
+            }
+        fi
 
-def ver(name):
-    try:
-        return version(name)
-    except PackageNotFoundError:
-        return "not-installed"
+        # per-attempt 计时
+        local attempt_start
+        attempt_start="$(date +%s)"
 
-(manifest_path, lm_eval_output, tasks_str, max_gen_toks, max_model_len,
- mnbt, mns, gmu, epc, model_path, run_name, run_id,
- start_iso, end_iso, elapsed, gpu_name, gpu_uuid, gpu_total_mem, gpu_index,
- lm_eval_ver, eval_limit, success_attempt) = sys.argv[1:23]
+        # 运行 lm-eval（generation-only: --predict_only）
+        set +e
+        "$LM_EVAL_CMD" \
+            --model vllm \
+            --model_args "$model_args" \
+            --tasks "$task" \
+            --include_path "$PROJECT_DIR/eval_tasks" \
+            --batch_size auto \
+            --gen_kwargs "$gen_kwargs" \
+            --output_path "$lm_eval_output" \
+            --predict_only \
+            --log_samples \
+            "${LIMIT_ARGS[@]}" \
+            > "$attempt_log" 2>&1 &
+        EVAL_CHILD_PID=$!
+        wait "$EVAL_CHILD_PID"
+        local rc=$?
+        EVAL_CHILD_PID=""
+        set -e
+
+        local attempt_end
+        attempt_end="$(date +%s)"
+        local attempt_elapsed=$((attempt_end - attempt_start))
+
+        log "  attempt $task_attempt exit code = $rc, elapsed = ${attempt_elapsed}s"
+
+        # 记录 attempt 信息
+        task_attempts_json="$(python - "$task_attempts_json" "$task_attempt" "$rc" "$attempt_elapsed" <<'PY'
+import json, sys
+arr = json.loads(sys.argv[1])
+att = int(sys.argv[2])
+rc = int(sys.argv[3])
+elapsed = int(sys.argv[4])
+status = "success" if rc == 0 else "oom" if rc != 0 else "failed"
+arr.append({"attempt": att, "exit_code": rc, "elapsed_seconds": elapsed, "status": status})
+print(json.dumps(arr))
+PY
+)"
+
+        if (( rc == 0 )); then
+            task_success=1
+            task_success_attempt=$task_attempt
+            task_success_mnbt=$mnbt
+            task_success_mns=$mns
+            task_success_gmu="$gmu"
+            task_success_pc="$prefix_caching"
+            task_success_level=$level
+            task_success_elapsed=$attempt_elapsed
+
+            # 成功后确认 vLLM 进程退出
+            wait_gpu_free "task=$task success cleanup" 30 || {
+                log "[WARN] task=$task 成功后 GPU 仍有进程，继续等待..." >&2
+            }
+            break
+        fi
+
+        # 判断是否 OOM
+        if grep -qiE "out of memory|OutOfMemoryError|CUDA error|HBM out of memory|torch\.cuda\.OutOfMemoryError" "$attempt_log"; then
+            log "  检测到 OOM，按 fallback 策略降低调度参数后重试。"
+            # 更新 attempt 状态为 oom
+            task_attempts_json="$(python - "$task_attempts_json" "$task_attempt" <<'PY'
+import json, sys
+arr = json.loads(sys.argv[1])
+att = int(sys.argv[2])
+for a in arr:
+    if a["attempt"] == att:
+        a["status"] = "oom"
+print(json.dumps(arr))
+PY
+)"
+            wait_gpu_free "OOM recovery task=$task" 30 || {
+                log "[ERROR] OOM 后 GPU 显存未释放，停止重试。" >&2
+                break
+            }
+            continue
+        else
+            log "  非 OOM 错误，停止重试。详见 $attempt_log" >&2
+            log "  错误摘要（最后 20 行）:" >&2
+            tail -20 "$attempt_log" >&2 || true
+            # 更新 attempt 状态为 error
+            task_attempts_json="$(python - "$task_attempts_json" "$task_attempt" <<'PY'
+import json, sys
+arr = json.loads(sys.argv[1])
+att = int(sys.argv[2])
+for a in arr:
+    if a["attempt"] == att:
+        a["status"] = "error"
+print(json.dumps(arr))
+PY
+)"
+            break
+        fi
+    done
+
+    if (( task_success != 1 )); then
+        log "[ERROR] task=$task 所有 fallback 配置均失败。" >&2
+        # 写失败 task manifest
+        python - "$task_manifest" "$task" "$task_attempts_json" <<'PY'
+import json, sys, os
+path, task, attempts_json = sys.argv[1], sys.argv[2], sys.argv[3]
+manifest = {
+    "status": "incomplete",
+    "task": task,
+    "attempts": json.loads(attempts_json),
+    "completion_errors": ["所有 fallback 配置均失败"],
+}
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(manifest, f, ensure_ascii=False, indent=2)
+os.replace(tmp, path)
+PY
+        return 6
+    fi
+
+    # ---------- task 完成度判定 ----------
+    local success_attempt_dir="$task_dir/attempts/attempt_${task_success_attempt}"
+    local success_lm_eval_output="$success_attempt_dir/lm_eval_output"
+
+    log "task=$task 执行完成度判定 (generation-only, 不要求 accuracy) ..."
+
+    MANIFEST_RC=0
+    python - \
+        "$task_manifest" \
+        "$success_lm_eval_output" \
+        "$task" \
+        "$MAX_GEN_TOKS" \
+        "$MAX_MODEL_LEN" \
+        "$task_success_mnbt" \
+        "$task_success_mns" \
+        "$task_success_gmu" \
+        "$task_success_pc" \
+        "$task_success_level" \
+        "$MODEL_PATH" \
+        "$RUN_NAME" \
+        "$RUN_ID" \
+        "$EXPECTED_COUNTS_JSON" \
+        "$EVAL_LIMIT" \
+        "$task_success_elapsed" \
+        "$task_attempts_json" \
+        "$GPU_INDEX" \
+        <<'PYEOF'
+import json, os, sys, glob
+
+(manifest_path, lm_eval_output, task, max_gen_toks, max_model_len,
+ mnbt, mns, gmu, epc, level, model_path, run_name, run_id,
+ expected_counts_json, eval_limit, success_elapsed, attempts_json,
+ gpu_index) = sys.argv[1:19]
 
 max_gen_toks = int(max_gen_toks)
 max_model_len = int(max_model_len)
 mnbt = int(mnbt)
 mns = int(mns)
-tasks = [t.strip() for t in tasks_str.split(",")]
+level = int(level)
+success_elapsed = int(success_elapsed)
+expected_counts = json.loads(expected_counts_json)
+attempts = json.loads(attempts_json)
 
 errors = []
 
@@ -437,20 +622,19 @@ errors = []
 results_files = []
 for pat in ("**/*results*.json", "**/results.json"):
     results_files.extend(glob.glob(os.path.join(lm_eval_output, pat), recursive=True))
-# 排除 sample jsonl 目录中的同名文件
 results_files = [f for f in results_files if f.endswith(".json")]
-# 去重
 results_files = sorted(set(results_files))
 
 if not results_files:
     errors.append("未找到 results JSON 文件")
-    results_json = None
     results_file_path = None
 else:
     results_file_path = results_files[0]
     print(f"[discover] results JSON: {results_file_path}")
 
-# --- 2. JSON 可解析 + 3 task 都存在 + 有 accuracy/exact_match ---
+# --- 2. results JSON 可解析 + task 存在 ---
+# generation-only 模式: 不要求 accuracy/exact_match
+# task 应出现在 results/configs 或 results 中
 results_data = None
 if results_file_path:
     try:
@@ -459,91 +643,96 @@ if results_file_path:
     except Exception as e:
         errors.append(f"results JSON 解析失败: {e}")
 
-task_results = {}
+task_in_results = False
 if results_data and isinstance(results_data, dict):
     task_results = results_data.get("results", {}) or {}
+    # predict_only 模式下 task 的值可能是空 dict 或 {"bypass": 0}
+    if task in task_results:
+        task_in_results = True
+    # 也检查 configs
+    configs = results_data.get("configs", {}) or {}
+    if task in configs:
+        task_in_results = True
+if not task_in_results:
+    # generation-only 下 results 可能为空，不强制要求
+    # 但记录警告
+    print(f"[warn] task '{task}' 不在 results JSON 中（predict_only 模式下可接受）")
 
-for t in tasks:
-    if t not in task_results:
-        errors.append(f"task '{t}' 不在 results JSON 中")
-        continue
-    tv = task_results[t]
-    if not isinstance(tv, dict):
-        errors.append(f"task '{t}' 的结果不是 dict")
-        continue
-    has_acc = any(k.startswith("exact_match") or k.startswith("acc") for k in tv)
-    if not has_acc:
-        errors.append(f"task '{t}' 缺少 accuracy/exact_match 指标")
-
-# --- 3. 递归发现每个 task 的 sample JSONL ---
-sample_files = {}
-for t in tasks:
-    # 匹配 samples*<task>*.jsonl
-    patterns = [
-        os.path.join(lm_eval_output, f"**/*samples*{t}*.jsonl"),
-        os.path.join(lm_eval_output, f"**/{t}*.jsonl"),
-        os.path.join(lm_eval_output, f"**/samples**/{t}/*.jsonl"),
-    ]
-    matches = []
-    for pat in patterns:
-        matches.extend(glob.glob(pat, recursive=True))
-    matches = sorted(set(matches))
-    if not matches:
-        errors.append(f"task '{t}' 未找到 sample JSONL 文件")
-        sample_files[t] = None
-    else:
-        sample_files[t] = matches[0]
-        print(f"[discover] sample {t}: {sample_files[t]}")
-
-# --- 4. smoke test 时每个文件恰好 EVAL_LIMIT 条；全量时检查预期条数 ---
-expected_counts = {}
-if eval_limit and eval_limit.strip():
-    n = int(eval_limit)
-    for t in tasks:
-        expected_counts[t] = n
+# --- 3. 递归发现 sample JSONL ---
+sample_file = None
+patterns = [
+    os.path.join(lm_eval_output, f"**/*samples*{task}*.jsonl"),
+    os.path.join(lm_eval_output, f"**/{task}*.jsonl"),
+    os.path.join(lm_eval_output, f"**/samples**/{task}/*.jsonl"),
+]
+matches = []
+for pat in patterns:
+    matches.extend(glob.glob(pat, recursive=True))
+matches = sorted(set(matches))
+if not matches:
+    errors.append(f"task '{task}' 未找到 sample JSONL 文件")
 else:
-    # 全量预期: MATH500=500, AIME24/AIME25 从 sample 文件实际读取
-    expected_counts = {"local_math500_32k": 500}
+    sample_file = matches[0]
+    print(f"[discover] sample {task}: {sample_file}")
 
-actual_counts = {}
-seen_ids = {}
-for t, fp in sample_files.items():
-    if fp is None:
-        actual_counts[t] = 0
-        continue
-    count = 0
-    ids = set()
-    with open(fp, encoding="utf-8") as f:
-        for line in f:
+# --- 4. sample JSONL 完整性检查 ---
+actual_count = 0
+seen_ids = set()
+has_empty_output = False
+if sample_file:
+    with open(sample_file, encoding="utf-8") as f:
+        for line_num, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
-            count += 1
+            actual_count += 1
             try:
                 obj = json.loads(line)
-                # doc_id 或 id 作为唯一标识
-                did = obj.get("doc_id") or obj.get("id") or str(count)
-                if did in ids:
-                    errors.append(f"task '{t}' 存在重复 sample (id={did})")
-                ids.add(did)
             except json.JSONDecodeError:
-                errors.append(f"task '{t}' sample JSONL 第 {count} 行解析失败")
-    actual_counts[t] = count
-    seen_ids[t] = ids
-    print(f"[count] {t}: {count} samples")
+                errors.append(f"task '{task}' sample JSONL 第 {line_num} 行解析失败")
+                continue
+            # doc_id 唯一性
+            did = obj.get("doc_id") or obj.get("id") or str(line_num)
+            if did in seen_ids:
+                errors.append(f"task '{task}' 存在重复 sample (doc_id={did})")
+            seen_ids.add(did)
+            # 检查输出非空
+            resps = obj.get("resps") or obj.get("filtered_resps")
+            if resps is None:
+                errors.append(f"task '{task}' 第 {line_num} 行缺少 resps/filtered_resps")
+            elif isinstance(resps, list) and len(resps) > 0:
+                first = resps[0]
+                if isinstance(first, list) and len(first) > 0:
+                    if not str(first[0]).strip():
+                        has_empty_output = True
+                elif isinstance(first, str) and not first.strip():
+                    has_empty_output = True
+            # 检查 prompt 或 arguments 存在
+            has_prompt = (obj.get("arguments") is not None or
+                          obj.get("prompt") is not None or
+                          obj.get("doc") is not None)
+            if not has_prompt:
+                errors.append(f"task '{task}' 第 {line_num} 行缺少 prompt/arguments/doc")
 
-    if t in expected_counts:
-        if count != expected_counts[t]:
-            errors.append(f"task '{t}' 样本数={count}, 预期={expected_counts[t]}")
-    elif not eval_limit.strip():
-        # 全量时记录实际数量（AIME24/AIME25 的数量由数据集决定）
-        print(f"[info] {t}: 全量实际数量={count}")
+    print(f"[count] {task}: {actual_count} samples")
+else:
+    actual_count = 0
 
-# --- 5. max_gen_toks 确认 ---
+# --- 5. 样本数量验证 ---
+expected = expected_counts.get(task, 0)
+if expected > 0 and actual_count != expected:
+    errors.append(f"task '{task}' 样本数={actual_count}, 预期={expected}")
+
+# --- 6. max_gen_toks 确认 ---
 if max_gen_toks != 32768:
     errors.append(f"max_gen_toks={max_gen_toks}, 预期=32768")
 
-# --- 6. 检查目标 GPU 无残留进程（通过 nvidia-smi 查询） ---
+# --- 7. max_model_len 确认 ---
+if max_model_len < max_gen_toks:
+    errors.append(f"max_model_len={max_model_len} < max_gen_toks={max_gen_toks}")
+
+# --- 8. 检查目标 GPU 无残留进程 ---
+import subprocess
 try:
     smi_out = subprocess.check_output(
         ["nvidia-smi", f"--id={gpu_index}", "--query-compute-apps=pid",
@@ -553,9 +742,13 @@ try:
     if smi_out:
         errors.append(f"目标 GPU (index={gpu_index}) 仍有残留进程: {smi_out}")
 except Exception:
-    pass  # nvidia-smi 查询失败不阻塞 manifest 写入
+    pass
 
-# --- 写 manifest ---
+# --- 计算总尝试耗时 ---
+total_attempt_elapsed = sum(a.get("elapsed_seconds", 0) for a in attempts)
+failed_attempt_elapsed = total_attempt_elapsed - success_elapsed
+
+# --- git commit ---
 git_commit = "unknown"
 try:
     git_commit = subprocess.check_output(
@@ -565,14 +758,27 @@ try:
 except Exception:
     pass
 
+# --- 版本信息 ---
+def ver(name):
+    try:
+        from importlib.metadata import version, PackageNotFoundError
+        return version(name)
+    except Exception:
+        return "not-installed"
+
+# --- 写 task manifest ---
 manifest = {
     "status": "complete" if not errors else "incomplete",
+    "task": task,
     "model_name": run_name,
     "model_path": model_path,
     "base_model": "meta-llama/Llama-3.1-8B",
     "run_id": run_id,
-    "tasks": tasks,
     "backend": "vllm",
+    "evaluation_mode": "generation_only",
+    "predict_only": True,
+    "judging_status": "pending_local",
+    "server_side_accuracy_valid": False,
     "dtype": "bfloat16",
     "temperature": 0.0,
     "do_sample": False,
@@ -582,6 +788,305 @@ manifest = {
     "max_num_seqs": mns,
     "gpu_memory_utilization": float(gmu),
     "enable_prefix_caching": (epc == "True"),
+    "fallback_level": level,
+    "tensor_parallel_size": 1,
+    "cuda_visible_devices": gpu_index,
+    "evaluation_protocol": "stock_zero_shot",
+    "num_fewshot": 0,
+    "apply_chat_template": False,
+    "boxed_answer_instruction": False,
+    "lm_eval_version": ver("lm_eval"),
+    "vllm_version": ver("vllm"),
+    "transformers_version": ver("transformers"),
+    "torch_version": ver("torch"),
+    "peft_version": ver("peft"),
+    "accelerate_version": ver("accelerate"),
+    "datasets_version": ver("datasets"),
+    "git_commit": git_commit,
+    "successful_attempt": len(attempts),
+    "successful_attempt_elapsed_seconds": success_elapsed,
+    "failed_attempt_elapsed_seconds": failed_attempt_elapsed,
+    "pipeline_elapsed_seconds": total_attempt_elapsed,
+    "attempts": attempts,
+    "expected_sample_count": expected,
+    "actual_sample_count": actual_count,
+    "has_empty_output": has_empty_output,
+    "lm_eval_results_file": results_file_path,
+    "lm_eval_sample_file": sample_file,
+    "completion_errors": errors,
+}
+
+tmp = manifest_path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(manifest, f, ensure_ascii=False, indent=2)
+os.replace(tmp, manifest_path)
+print(f"[task_manifest] written: {manifest_path}")
+
+if errors:
+    print("[ERROR] task 完成度判定失败:", file=sys.stderr)
+    for e in errors:
+        print(f"  - {e}", file=sys.stderr)
+    sys.exit(1)
+else:
+    print(f"[OK] task={task} 完成度判定通过 (generation-only)")
+PYEOF
+    MANIFEST_RC=$?
+    if (( MANIFEST_RC != 0 )); then
+        log "[ERROR] task=$task 完成度判定失败" >&2
+        return 8
+    fi
+
+    log "task=$task 完成。成功 attempt=$task_success_attempt, level=$task_success_level, 耗时=${task_success_elapsed}s"
+
+    # 导出该 task 的统一 JSONL
+    local export_py="$PROJECT_DIR/scripts/export_generation_outputs.py"
+    if [[ -f "$export_py" ]]; then
+        log "导出 $task 的统一 JSONL ..."
+        local model_short
+        case "$RUN_NAME" in
+            *LIMO*|*limo*|LIMO*) model_short="limo" ;;
+            *OpenR1*|*openr1*|OpenR1*) model_short="openr1" ;;
+            *) model_short="$(echo "$RUN_NAME" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]')" ;;
+        esac
+        local bench_short
+        case "$task" in
+            *math500*) bench_short="math500" ;;
+            *aime24*) bench_short="aime24" ;;
+            *aime25*) bench_short="aime25" ;;
+            *) bench_short="$task" ;;
+        esac
+        local smoke_suffix=""
+        if [[ -n "$EVAL_LIMIT" ]]; then
+            smoke_suffix="_smoke${EVAL_LIMIT}"
+        fi
+        local export_out="$PROJECT_DIR/results/generated_outputs/${model_short}_${bench_short}${smoke_suffix}.jsonl"
+        python "$export_py" \
+            --task_manifest "$task_manifest" \
+            --model_name "$RUN_NAME" \
+            --model_path "$MODEL_PATH" \
+            --out "$export_out" \
+            2>&1 | tee -a "$RUNTIME_LOG" || log "[WARN] 导出 $task JSONL 失败（不影响评测完整性）。"
+    fi
+
+    return 0
+}
+
+# ---------- 13. 串行运行所有 task ----------
+PIPELINE_START="$(date +%s)"
+PIPELINE_START_ISO="$(date '+%F %T %z')"
+
+# 第一个 task 使用正常 fallback，后续 task 使用第一个 task 的成功配置
+FIRST_TASK_CONFIG=""
+ALL_TASK_SUCCESS=1
+TASK_RESULTS=()
+
+for i in "${!ALL_TASKS[@]}"; do
+    task="${ALL_TASKS[$i]}"
+    task_rc=0
+
+    if [[ $i -eq 0 ]]; then
+        # 第一个 task：使用 fallback（或 FORCE_CONFIG）
+        if run_task "$task" "${FORCE_CONFIG:-}"; then
+            task_rc=0
+        else
+            task_rc=$?
+        fi
+    else
+        # 后续 task：使用第一个 task 的成功配置
+        if [[ -n "$FIRST_TASK_CONFIG" ]]; then
+            if run_task "$task" "$FIRST_TASK_CONFIG"; then
+                task_rc=0
+            else
+                task_rc=$?
+            fi
+        else
+            # 第一个 task 没有成功配置，后续 task 也用 fallback
+            if run_task "$task" "${FORCE_CONFIG:-}"; then
+                task_rc=0
+            else
+                task_rc=$?
+            fi
+        fi
+    fi
+
+    TASK_RESULTS+=("$task:$task_rc")
+
+    # 如果是第一个 task 且成功，读取成功配置
+    if [[ $i -eq 0 && $task_rc -eq 0 ]]; then
+        task_manifest="$RUN_DIR/tasks/$task/task_manifest.json"
+        FIRST_TASK_CONFIG="$(python - "$task_manifest" <<'PY'
+import json, sys
+try:
+    m = json.load(open(sys.argv[1], encoding="utf-8"))
+    level = m.get("fallback_level", 0)
+    mnbt = m["max_num_batched_tokens"]
+    mns = m["max_num_seqs"]
+    gmu = m["gpu_memory_utilization"]
+    pc = "True" if m["enable_prefix_caching"] else "False"
+    print(f"{level} {mnbt} {mns} {gmu} {pc}")
+except Exception:
+    print("")
+PY
+)" || FIRST_TASK_CONFIG=""
+        log "第一个 task 成功配置: $FIRST_TASK_CONFIG"
+        SUCCESS_LEVEL="$(echo "$FIRST_TASK_CONFIG" | cut -d' ' -f1)"
+        SUCCESS_MNBT="$(echo "$FIRST_TASK_CONFIG" | cut -d' ' -f2)"
+        SUCCESS_MNS="$(echo "$FIRST_TASK_CONFIG" | cut -d' ' -f3)"
+        SUCCESS_GMU="$(echo "$FIRST_TASK_CONFIG" | cut -d' ' -f4)"
+        SUCCESS_PC="$(echo "$FIRST_TASK_CONFIG" | cut -d' ' -f5)"
+    fi
+
+    if (( task_rc != 0 )); then
+        ALL_TASK_SUCCESS=0
+        log "[ERROR] task=$task 失败 (rc=$task_rc)，停止后续 task。" >&2
+        break
+    fi
+done
+
+PIPELINE_END="$(date +%s)"
+PIPELINE_END_ISO="$(date '+%F %T %z')"
+PIPELINE_ELAPSED=$((PIPELINE_END - PIPELINE_START))
+
+# 停掉 GPU 监控
+stop_gpu_monitor
+
+# 解析 GPU 峰值
+GPU_PEAK_MIB="$(parse_gpu_peak)"
+log "GPU 峰值显存 (MiB) = ${GPU_PEAK_MIB}"
+
+# ---------- 14. 写 run_manifest.json ----------
+log "写 run_manifest.json ..."
+if (( ALL_TASK_SUCCESS != 1 )); then
+    log "[ERROR] 部分 task 失败，run 标记为 incomplete。" >&2
+    log "  task 结果: ${TASK_RESULTS[*]}" >&2
+fi
+
+# 收集所有 task manifest 信息
+python - \
+    "$MANIFEST" \
+    "$RUN_DIR" \
+    "$MODEL_PATH" \
+    "$RUN_NAME" \
+    "$RUN_ID" \
+    "$PIPELINE_START_ISO" \
+    "$PIPELINE_END_ISO" \
+    "$PIPELINE_ELAPSED" \
+    "$GPU_NAME" \
+    "$GPU_UUID" \
+    "$GPU_TOTAL_MEM" \
+    "$GPU_PEAK_MIB" \
+    "$GPU_INDEX" \
+    "$MAX_GEN_TOKS" \
+    "$MAX_MODEL_LEN" \
+    "$SUCCESS_LEVEL" \
+    "$SUCCESS_MNBT" \
+    "$SUCCESS_MNS" \
+    "$SUCCESS_GMU" \
+    "$SUCCESS_PC" \
+    "$ALL_TASK_SUCCESS" \
+    "$EVAL_LIMIT" \
+    "$EXPECTED_COUNTS_JSON" \
+    <<'PYEOF'
+import json, os, sys, glob
+
+(manifest_path, run_dir, model_path, run_name, run_id,
+ start_iso, end_iso, pipeline_elapsed, gpu_name, gpu_uuid, gpu_total_mem,
+ gpu_peak_mib, gpu_index, max_gen_toks, max_model_len,
+ success_level, success_mnbt, success_mns, success_gmu, success_pc,
+ all_task_success, eval_limit, expected_counts_json) = sys.argv[1:24]
+
+max_gen_toks = int(max_gen_toks)
+max_model_len = int(max_model_len)
+pipeline_elapsed = int(pipeline_elapsed)
+gpu_peak_mib = int(gpu_peak_mib) if str(gpu_peak_mib).isdigit() else 0
+all_task_success = int(all_task_success)
+expected_counts = json.loads(expected_counts_json)
+
+# 收集每个 task 的 manifest
+task_manifests = {}
+task_errors = []
+total_success_elapsed = 0
+total_failed_elapsed = 0
+actual_counts = {}
+
+tasks = ["local_math500_32k", "local_aime24_32k", "local_aime25_32k"]
+for task in tasks:
+    tm_path = os.path.join(run_dir, "tasks", task, "task_manifest.json")
+    if os.path.isfile(tm_path):
+        try:
+            with open(tm_path, encoding="utf-8") as f:
+                tm = json.load(f)
+            task_manifests[task] = tm
+            if tm.get("status") != "complete":
+                task_errors.append(f"task '{task}' status={tm.get('status')}")
+            total_success_elapsed += tm.get("successful_attempt_elapsed_seconds", 0)
+            total_failed_elapsed += tm.get("failed_attempt_elapsed_seconds", 0)
+            actual_counts[task] = tm.get("actual_sample_count", 0)
+        except Exception as e:
+            task_errors.append(f"task '{task}' manifest 解析失败: {e}")
+    else:
+        task_errors.append(f"task '{task}' manifest 不存在")
+        actual_counts[task] = 0
+
+# git commit
+import subprocess
+git_commit = "unknown"
+try:
+    git_commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"],
+        stderr=subprocess.DEVNULL, cwd=os.getcwd()
+    ).decode().strip()
+except Exception:
+    pass
+
+def ver(name):
+    try:
+        from importlib.metadata import version, PackageNotFoundError
+        return version(name)
+    except Exception:
+        return "not-installed"
+
+# 合并所有 task 的 sample 文件路径
+sample_files = {}
+for task, tm in task_manifests.items():
+    sf = tm.get("lm_eval_sample_file")
+    if sf:
+        sample_files[task] = sf
+
+# 合并所有 task 的 results 文件路径
+results_file = None
+for task, tm in task_manifests.items():
+    rf = tm.get("lm_eval_results_file")
+    if rf:
+        results_file = rf
+        break
+
+run_errors = list(task_errors)
+if all_task_success != 1:
+    run_errors.append("部分 task 失败")
+
+manifest = {
+    "status": "complete" if not run_errors and all_task_success == 1 else "incomplete",
+    "model_name": run_name,
+    "model_path": model_path,
+    "base_model": "meta-llama/Llama-3.1-8B",
+    "run_id": run_id,
+    "tasks": tasks,
+    "backend": "vllm",
+    "evaluation_mode": "generation_only",
+    "predict_only": True,
+    "judging_status": "pending_local",
+    "server_side_accuracy_valid": False,
+    "dtype": "bfloat16",
+    "temperature": 0.0,
+    "do_sample": False,
+    "max_gen_toks": max_gen_toks,
+    "max_model_len": max_model_len,
+    "max_num_batched_tokens": int(success_mnbt) if success_mnbt else 0,
+    "max_num_seqs": int(success_mns) if success_mns else 0,
+    "gpu_memory_utilization": float(success_gmu) if success_gmu else 0.0,
+    "enable_prefix_caching": (success_pc == "True") if success_pc else False,
+    "fallback_level": int(success_level) if success_level else 0,
     "tensor_parallel_size": 1,
     "cuda_visible_devices": gpu_index,
     "evaluation_protocol": "stock_zero_shot",
@@ -591,7 +1096,8 @@ manifest = {
     "gpu_name": gpu_name,
     "gpu_uuid": gpu_uuid,
     "gpu_total_memory": gpu_total_mem,
-    "lm_eval_version": lm_eval_ver,
+    "gpu_peak_memory_mib": gpu_peak_mib,
+    "lm_eval_version": ver("lm_eval"),
     "vllm_version": ver("vllm"),
     "transformers_version": ver("transformers"),
     "torch_version": ver("torch"),
@@ -601,37 +1107,41 @@ manifest = {
     "git_commit": git_commit,
     "start_time": start_iso,
     "end_time": end_iso,
-    "elapsed_seconds": int(elapsed),
-    "successful_attempt": int(success_attempt),
-    "lm_eval_results_file": results_file_path,
-    "lm_eval_sample_files": sample_files,
-    "completion_errors": errors,
+    "pipeline_elapsed_seconds": pipeline_elapsed,
+    "successful_attempt_elapsed_seconds": total_success_elapsed,
+    "failed_attempt_elapsed_seconds": total_failed_elapsed,
+    "successful_attempt": 1,
+    "expected_sample_counts": expected_counts,
     "actual_sample_counts": actual_counts,
+    "task_manifests": {t: os.path.join("tasks", t, "task_manifest.json")
+                       for t in task_manifests},
+    "lm_eval_results_file": results_file,
+    "lm_eval_sample_files": sample_files,
+    "completion_errors": run_errors,
 }
 
 tmp = manifest_path + ".tmp"
 with open(tmp, "w", encoding="utf-8") as f:
     json.dump(manifest, f, ensure_ascii=False, indent=2)
 os.replace(tmp, manifest_path)
-print(f"[manifest] written: {manifest_path}")
+print(f"[run_manifest] written: {manifest_path}")
 
-if errors:
-    print("[ERROR] 完成度判定失败:", file=sys.stderr)
-    for e in errors:
+if run_errors:
+    print("[ERROR] run 完成度判定失败:", file=sys.stderr)
+    for e in run_errors:
         print(f"  - {e}", file=sys.stderr)
     sys.exit(1)
 else:
-    print("[OK] 12 条完成度判定全部通过")
+    print("[OK] run 完成度判定通过 (generation-only)")
 PYEOF
 
-MANIFEST_RC=$?
-if (( MANIFEST_RC != 0 )); then
-    log "[ERROR] 完成度判定失败，manifest 状态为 incomplete。" >&2
-    log "  详见 $MANIFEST" >&2
+RUN_MANIFEST_RC=$?
+if (( RUN_MANIFEST_RC != 0 )); then
+    log "[ERROR] run_manifest 完成度判定失败" >&2
     exit 8
 fi
 
-# ---------- 10. 原子更新 active_run.json ----------
+# ---------- 15. 原子更新 active_run.json ----------
 log "原子更新 active_run.json ..."
 python - "$ACTIVE_RUN_JSON" "$RUN_ID" <<'PY'
 import json, os, sys
@@ -644,22 +1154,7 @@ os.replace(tmp, path)
 print(f"[active_run] updated: {path} -> {run_id}")
 PY
 
-# ---------- 11. GPU 峰值统计 ----------
-if [[ -f "$GPU_LOG" ]]; then
-    PEAK_MEM="$(python - "$GPU_LOG" <<'PY'
-import sys
-peak = 0
-for line in open(sys.argv[1], encoding="utf-8", errors="ignore"):
-    parts = [p.strip() for p in line.split(",")]
-    if len(parts) >= 2 and parts[1].isdigit():
-        peak = max(peak, int(parts[1]))
-print(peak)
-PY
-)" || PEAK_MEM="unknown"
-    log "GPU 峰值显存 (MiB) = ${PEAK_MEM}"
-fi
-
-# ---------- 12. 效率统计 ----------
+# ---------- 16. 效率统计 ----------
 log "生成 efficiency_summary.json ..."
 EFF_PY="$PROJECT_DIR/scripts/summarize_eval_efficiency.py"
 if [[ -f "$EFF_PY" ]]; then
@@ -667,11 +1162,12 @@ if [[ -f "$EFF_PY" ]]; then
         --result_dir "$RUN_DIR" \
         --single_mode 1 \
         --out_json "$RUN_DIR/efficiency_summary.json" \
-        2>&1 | tee -a "$RUNTIME_LOG" || log "[WARN] efficiency summary 生成失败（不影响评测结果完整性）。"
+        2>&1 | tee -a "$RUNTIME_LOG" || log "[WARN] efficiency summary 生成失败。"
 fi
 
-log "================ 评测完成: $RUN_NAME ================"
+log "================ 评测完成: $RUN_NAME (generation-only) ================"
 log "结果目录: $RUN_DIR"
 log "manifest: $MANIFEST"
 log "active_run: $ACTIVE_RUN_JSON"
+log "GPU 峰值: ${GPU_PEAK_MIB} MiB"
 exit 0

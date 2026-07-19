@@ -23,12 +23,12 @@
 #
 # 以下仅列出 vllm 安装之外的补充依赖（limo_sft 已含 torch/transformers/peft 等，不重复指定版本）。
 # 注意: torch 必须保持 limo_sft 的 2.5.1+cu121，不能让 vllm 拉成 2.5.1+cu124 或其他。
+#
+# 本轮为 generation-only 模式（--predict_only），不在服务器端判分，
+# 因此不需要 math_verify。判分在本地独立进行。
 
 # vLLM 主体（会自动带入兼容的 xformers / ray 等）
 vllm==0.6.6.post1
-
-# 数学答案校验（lm-eval 0.4.5 hendrycks_math 的 is_equiv 不依赖此包，但部分任务用）
-math_verify==0.7.0
 
 # lm-eval 0.4.5 已在 limo_sft 中，这里只做版本声明以便 pip check
 # lm_eval==0.4.5

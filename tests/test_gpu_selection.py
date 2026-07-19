@@ -138,12 +138,12 @@ echo "attempt=$attempt"
         if not script_path.is_file():
             pytest.skip("run_eval_single_l40_vllm.sh not found")
         content = script_path.read_text(encoding="utf-8")
-        # 检查 attempt=0 出现在 attempt=$((attempt + 1)) 之前
+        # 检查 attempt=0 出现在 task_attempt=$((task_attempt + 1)) 之前
         init_pos = content.find("attempt=0")
-        inc_pos = content.find("attempt=$((attempt + 1))")
+        inc_pos = content.find("task_attempt=$((task_attempt + 1))")
         assert init_pos >= 0, "脚本中未找到 attempt=0 初始化"
-        assert inc_pos >= 0, "脚本中未找到 attempt=$((attempt + 1))"
-        assert init_pos < inc_pos, "attempt=0 必须在 attempt=$((attempt + 1)) 之前"
+        assert inc_pos >= 0, "脚本中未找到 task_attempt=$((task_attempt + 1))"
+        assert init_pos < inc_pos, "attempt=0 必须在 task_attempt=$((task_attempt + 1)) 之前"
 
 
 class TestCleanup:
@@ -286,16 +286,16 @@ class TestScriptContent:
         assert "FORCE_CONFIG" in content, "脚本中未找到 FORCE_CONFIG 环境变量支持"
 
     def test_attempt_init_in_single_script(self):
-        """run_eval_single_l40_vllm.sh 中 attempt=0 必须在 attempt=$((attempt + 1)) 之前。"""
+        """run_eval_single_l40_vllm.sh 中 attempt=0 必须在 task_attempt=$((task_attempt + 1)) 之前。"""
         script_path = SCRIPTS_DIR / "run_eval_single_l40_vllm.sh"
         if not script_path.is_file():
             pytest.skip("script not found")
         content = script_path.read_text(encoding="utf-8")
         init_pos = content.find("attempt=0")
-        inc_pos = content.find("attempt=$((attempt + 1))")
+        inc_pos = content.find("task_attempt=$((task_attempt + 1))")
         assert init_pos >= 0, "脚本中未找到 attempt=0 初始化"
-        assert inc_pos >= 0, "脚本中未找到 attempt=$((attempt + 1))"
-        assert init_pos < inc_pos, "attempt=0 必须在 attempt=$((attempt + 1)) 之前"
+        assert inc_pos >= 0, "脚本中未找到 task_attempt=$((task_attempt + 1))"
+        assert init_pos < inc_pos, "attempt=0 必须在 task_attempt=$((task_attempt + 1)) 之前"
 
     def test_no_set_e_suppression_in_task_check(self):
         """task 检查命令附近不能有 set +e 吞错误。"""
@@ -361,30 +361,242 @@ class TestConfigConsistency:
         )
         assert config_match is True
 
-    @pytest.mark.skipif(not has_bash, reason="bash not available")
-    def test_conservativeness_function(self):
-        """测试 config_conservativeness 函数"""
-        script = """
-# 从 run_eval_two_models_single_l40.sh 中提取的函数
-config_conservativeness() {
-    local cfg="$1"
-    case "$cfg" in
-        "8192 32 0.90 True")  echo 1 ;;
-        "4096 16 0.90 True")  echo 2 ;;
-        "2048 8  0.88 True")  echo 3 ;;
-        "2048 4  0.88 False") echo 4 ;;
-        *) echo 0 ;;
-    esac
-}
-echo "$(config_conservativeness '8192 32 0.90 True')"
-echo "$(config_conservativeness '2048 4  0.88 False')"
-echo "$(config_conservativeness 'unknown config')"
+    def test_config_comparison_float_equal(self):
+        """0.90 和 0.9 应被视为相等（浮点数值比较，非字符串比较）"""
+        # 模拟两个模型的配置字符串
+        c1 = "1 8192 32 0.90 True"
+        c2 = "1 8192 32 0.9 True"
+
+        # 解析并比较（与脚本中的 configs_equal 函数逻辑一致）
+        parts1 = c1.split()
+        parts2 = c2.split()
+
+        assert len(parts1) == 5
+        assert len(parts2) == 5
+
+        level1, mnbt1, mns1, gmu1, pc1 = parts1
+        level2, mnbt2, mns2, gmu2, pc2 = parts2
+
+        # 逐字段比较（数值用 float 比较）
+        assert int(level1) == int(level2)
+        assert int(mnbt1) == int(mnbt2)
+        assert int(mns1) == int(mns2)
+        assert abs(float(gmu1) - float(gmu2)) < 1e-6
+        assert pc1 == pc2
+
+    def test_config_comparison_different_level(self):
+        """不同 fallback level 的配置应被视为不同"""
+        c1 = "1 8192 32 0.90 True"
+        c2 = "2 4096 16 0.90 True"
+
+        parts1 = c1.split()
+        parts2 = c2.split()
+
+        assert int(parts1[0]) != int(parts2[0])
+        assert int(parts1[1]) != int(parts2[1])
+
+
+class TestGenerationOnly:
+    """generation-only 模式相关测试"""
+
+    def test_predict_only_in_single_script(self):
+        """run_eval_single_l40_vllm.sh 中必须包含 --predict_only"""
+        script_path = SCRIPTS_DIR / "run_eval_single_l40_vllm.sh"
+        if not script_path.is_file():
+            pytest.skip("script not found")
+        content = script_path.read_text(encoding="utf-8")
+        assert "--predict_only" in content, \
+            "脚本中未找到 --predict_only（generation-only 模式必需）"
+
+    def test_generation_only_manifest_fields(self):
+        """脚本中必须记录 generation-only manifest 字段"""
+        script_path = SCRIPTS_DIR / "run_eval_single_l40_vllm.sh"
+        if not script_path.is_file():
+            pytest.skip("script not found")
+        content = script_path.read_text(encoding="utf-8")
+        assert "generation_only" in content, \
+            "脚本中未记录 evaluation_mode=generation_only"
+        assert "predict_only" in content, \
+            "脚本中未记录 predict_only"
+        assert "pending_local" in content, \
+            "脚本中未记录 judging_status=pending_local"
+        assert "server_side_accuracy_valid" in content, \
+            "脚本中未记录 server_side_accuracy_valid"
+
+    def test_no_accuracy_required_in_completion(self):
+        """完成度判定不应要求 accuracy/exact_match"""
+        script_path = SCRIPTS_DIR / "run_eval_single_l40_vllm.sh"
+        if not script_path.is_file():
+            pytest.skip("script not found")
+        content = script_path.read_text(encoding="utf-8")
+        # 不应出现要求 accuracy 的代码
+        assert "has_acc" not in content or \
+               "exact_match" not in content.split("has_acc")[0].split("\n")[-1], \
+            "完成度判定不应依赖 accuracy/exact_match"
+
+    def test_task_level_execution(self):
+        """脚本中应实现 task 级执行（每个 task 独立调用 lm-eval）"""
+        script_path = SCRIPTS_DIR / "run_eval_single_l40_vllm.sh"
+        if not script_path.is_file():
+            pytest.skip("script not found")
+        content = script_path.read_text(encoding="utf-8")
+        assert "run_task" in content or "for task in" in content or \
+               "for i in" in content, \
+            "脚本中未实现 task 级执行"
+        assert "tasks/" in content, \
+            "脚本中未使用 task 级目录结构"
+
+    def test_per_attempt_timing(self):
+        """脚本中应实现 per-attempt 计时"""
+        script_path = SCRIPTS_DIR / "run_eval_single_l40_vllm.sh"
+        if not script_path.is_file():
+            pytest.skip("script not found")
+        content = script_path.read_text(encoding="utf-8")
+        assert "attempt_start" in content or "ATTEMPT_START" in content, \
+            "脚本中未实现 per-attempt 计时"
+        assert "successful_attempt_elapsed_seconds" in content, \
+            "脚本中未记录 successful_attempt_elapsed_seconds"
+
+    def test_gpu_free_before_first_attempt(self):
+        """脚本中在第一次 attempt 前必须检查 GPU 空闲"""
+        script_path = SCRIPTS_DIR / "run_eval_single_l40_vllm.sh"
+        if not script_path.is_file():
+            pytest.skip("script not found")
+        content = script_path.read_text(encoding="utf-8")
+        assert "before first attempt" in content, \
+            "脚本中未在第一次 attempt 前检查 GPU 空闲"
+
+    def test_gpu_peak_memory_in_manifest(self):
+        """脚本中必须将 GPU 峰值显存写入 manifest"""
+        script_path = SCRIPTS_DIR / "run_eval_single_l40_vllm.sh"
+        if not script_path.is_file():
+            pytest.skip("script not found")
+        content = script_path.read_text(encoding="utf-8")
+        assert "gpu_peak_memory_mib" in content, \
+            "脚本中未将 gpu_peak_memory_mib 写入 manifest"
+
+    def test_fallback_config_format_with_level(self):
+        """fallback 配置应使用 level 前缀格式"""
+        script_path = SCRIPTS_DIR / "run_eval_single_l40_vllm.sh"
+        if not script_path.is_file():
+            pytest.skip("script not found")
+        content = script_path.read_text(encoding="utf-8")
+        # 检查 fallback 配置格式为 "level mnbt mns gmu epc"
+        assert '"1 8192 32 0.90 True"' in content or \
+               '"1 8192 32 0.90 True"' in content.replace("'", '"'), \
+            "fallback 配置应使用 level 前缀格式"
+
+    def test_eval_one_captures_rc(self):
+        """two_models 脚本中 eval_one 必须用 || rc=$? 捕获返回码"""
+        script_path = SCRIPTS_DIR / "run_eval_two_models_single_l40.sh"
+        if not script_path.is_file():
+            pytest.skip("script not found")
+        content = script_path.read_text(encoding="utf-8")
+        assert "|| rc=$?" in content or "rc=$?" in content, \
+            "eval_one 必须用 || rc=$? 捕获返回码，避免 set -e 提前退出"
+
+    def test_openr1_fallback_reachable(self):
+        """two_models 脚本中 OpenR1 fallback 必须可达"""
+        script_path = SCRIPTS_DIR / "run_eval_two_models_single_l40.sh"
+        if not script_path.is_file():
+            pytest.skip("script not found")
+        content = script_path.read_text(encoding="utf-8")
+        # 检查 OpenR1 失败后能进入 fallback
+        assert "OPENR1_RC" in content, \
+            "脚本中未使用 OPENR1_RC 变量捕获 OpenR1 返回码"
+        assert "FORCE_RERUN=1 eval_one" in content or \
+               "FORCE_RERUN=1" in content, \
+            "脚本中未实现 OpenR1 fallback 后重跑"
+
+    def test_smoke_full_separation(self):
+        """two_models 脚本中 smoke 和 full 结果应分开"""
+        script_path = SCRIPTS_DIR / "run_eval_two_models_single_l40.sh"
+        if not script_path.is_file():
+            pytest.skip("script not found")
+        content = script_path.read_text(encoding="utf-8")
+        assert "SMOKE_SUFFIX" in content or "_smoke" in content, \
+            "脚本中未实现 smoke/full 结果分离"
+        assert "generation_comparison_32k" in content, \
+            "脚本中应使用 generation_comparison_32k 作为输出名"
+
+    def test_export_jsonl_called(self):
+        """single 脚本中应调用 export_generation_outputs.py"""
+        script_path = SCRIPTS_DIR / "run_eval_single_l40_vllm.sh"
+        if not script_path.is_file():
+            pytest.skip("script not found")
+        content = script_path.read_text(encoding="utf-8")
+        assert "export_generation_outputs.py" in content, \
+            "脚本中未调用 export_generation_outputs.py"
+
+    def test_no_pip_install_math_verify(self):
+        """requirements-eval-vllm-cu121.txt 中不应包含 math_verify"""
+        req_path = PROJECT_DIR / "requirements-eval-vllm-cu121.txt"
+        if not req_path.is_file():
+            pytest.skip("requirements file not found")
+        content = req_path.read_text(encoding="utf-8")
+        # math_verify 不应出现在非注释行中
+        for line in content.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            if stripped and not stripped.startswith("#"):
+                assert "math_verify" not in stripped, \
+                    "requirements-eval-vllm-cu121.txt 不应依赖 math_verify"
+
+
+class TestGPUMemoryParsing:
+    """GPU 显存解析测试"""
+
+    def test_parse_gpu_peak_with_nounits(self):
+        """解析 nvidia-smi nounits 格式的 GPU 峰值显存"""
+        # 模拟 GPU 监控日志（nounits 格式）
+        gpu_log_content = """2026/07/19 12:00:00, 42120, 46068, 98
+2026/07/19 12:00:05, 38000, 46068, 95
+2026/07/19 12:00:10, 45000, 46068, 99
+2026/07/19 12:00:15, 39000, 46068, 92
 """
-        result = subprocess.run(
-            ["bash", "-c", script], capture_output=True, text=True, timeout=10
-        )
-        assert result.returncode == 0
-        lines = result.stdout.strip().split("\n")
-        assert lines[0] == "1"
-        assert lines[1] == "4"
-        assert lines[2] == "0"
+        # 解析逻辑（与脚本中的 parse_gpu_peak 一致）
+        peak = 0
+        for line in gpu_log_content.strip().split("\n"):
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 2:
+                try:
+                    val = int(float(parts[1]))
+                    if val > peak:
+                        peak = val
+                except (ValueError, TypeError):
+                    pass
+
+        assert peak == 45000, f"Expected peak=45000, got {peak}"
+
+    def test_parse_gpu_peak_with_spaces(self):
+        """解析带空格的 nvidia-smi 输出"""
+        gpu_log_content = """2026/07/19 12:00:00,  42120,  46068,  98
+2026/07/19 12:00:05,  38000,  46068,  95
+"""
+        peak = 0
+        for line in gpu_log_content.strip().split("\n"):
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 2:
+                try:
+                    val = int(float(parts[1]))
+                    if val > peak:
+                        peak = val
+                except (ValueError, TypeError):
+                    pass
+
+        assert peak == 42120
+
+    def test_parse_gpu_peak_empty_log(self):
+        """空日志应返回 0"""
+        peak = 0
+        for line in "":
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 2:
+                try:
+                    val = int(float(parts[1]))
+                    if val > peak:
+                        peak = val
+                except (ValueError, TypeError):
+                    pass
+        assert peak == 0

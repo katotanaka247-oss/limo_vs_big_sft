@@ -168,11 +168,16 @@ python scripts/merge_lora.py \
     --out_dir outputs/llama31_8b_limo_817_merged
 ```
 
-## 单卡 L40：MATH500、AIME24、AIME25，32K 最大生成长度评测
+## 单卡 L40：MATH500、AIME24、AIME25，32K 最大生成长度评测（generation-only）
 
 本章节是**正式评测流程**。在单张 NVIDIA L40 48GB 上，用 lm-evaluation-harness 的 **vLLM backend**
 （continuous batching）串行评测两个模型，最大生成长度严格为 **32768 tokens**，两模型使用完全相同的
 backend / prompt / task / 生成参数，仅 LoRA adapter 与输出目录不同。
+
+> **本轮为 generation-only 模式（`--predict_only`）**：不在服务器端判分，不依赖 `math_utils.py` 的
+> exact-match，不把服务器端 accuracy 作为实验成功条件。目标是在单张 L40 上完整生成 MATH500、AIME24、
+> AIME25 的模型输出，并保存为后续可在本地独立判分的结构化 JSONL。manifest 中标记
+> `evaluation_mode=generation_only`、`judging_status=pending_local`、`server_side_accuracy_valid=false`。
 
 > 旧脚本 `scripts/run_eval_lm_eval.sh`（Transformers `hf` backend + `batch_size=1` + 含糊的 `math500` 任务名）
 > 已废弃，仅保留作快速调试，详见文件头注释。
@@ -288,15 +293,20 @@ trust_remote_code=True
 - `max_num_seqs` 通过 vLLM model_args `**kwargs` 传递（lm-eval 0.4.5 VLLM backend 支持）。
 - OOM fallback 4 次尝试（`max_gen_toks` 始终 32768，`max_model_len` 始终不变，task/prompt 不变）：
 
-| attempt | max_num_batched_tokens | max_num_seqs | gpu_mem_util | prefix_cache |
-|---------|----------------------:|-------------:|-------------:|:------------:|
-| 1       | 8192                  | 32           | 0.90         | True         |
-| 2       | 4096                  | 16           | 0.90         | True         |
-| 3       | 2048                  | 8            | 0.88         | True         |
-| 4       | 2048                  | 4            | 0.88         | False        |
+| level | max_num_batched_tokens | max_num_seqs | gpu_mem_util | prefix_cache |
+|-------|----------------------:|-------------:|-------------:|:------------:|
+| 1     | 8192                  | 32           | 0.90         | True         |
+| 2     | 4096                  | 16           | 0.90         | True         |
+| 3     | 2048                  | 8            | 0.88         | True         |
+| 4     | 2048                  | 4            | 0.88         | False        |
 
+- manifest 记录 `fallback_level` 字段，两模型公平性比较使用**数值比较**（非字符串比较），
+  `0.90` 与 `0.9` 视为相等。
 - 非 OOM 错误立即停止，不盲目 fallback。
-- 每次 attempt 使用独立输出目录 `attempts/attempt_N/lm_eval_output/`，等待前一个 vLLM 进程完全退出并验证 GPU 显存释放后才启动下一次。
+- 每个 task 独立调用 lm-eval（task 级断点恢复），每次 attempt 使用独立输出目录
+  `attempts/attempt_N/lm_eval_output/`，等待前一个 vLLM 进程完全退出并验证 GPU 显存释放后才启动下一次。
+- 每个 attempt 独立计时，效率统计使用 `successful_attempt_elapsed_seconds`（不含失败 attempt、
+  等待显存释放、fallback、模型重新加载时间），不使用整个 pipeline 耗时计算 tokens/s。
 
 ### 5. Smoke Test（每 benchmark 2 条样本）
 
@@ -345,36 +355,82 @@ results/limo_817_math500_aime24_aime25_32k/
       efficiency_summary.json
       prompt_length_check.json
       nvidia_smi.log                     # GPU 显存采样
-      attempt_1.log                      # OOM fallback 各次尝试日志
-      attempts/
-        attempt_1/
-          lm_eval_output/                # lm-eval --output_path
-            <model>_results.json
-            samples/
-              local_math500_32k/
-              local_aime24_32k/
-              local_aime25_32k/
+      tasks/                             # task 级独立目录（断点恢复）
+        local_math500_32k/
+          task_manifest.json             # task 级 manifest
+          samples.jsonl                  # lm-eval sample 输出
+          exported_generations.jsonl     # 统一格式导出
+          runtime.log
+          attempt_1.log
+          attempts/
+            attempt_1/
+              lm_eval_output/
+        local_aime24_32k/
+          ...
+        local_aime25_32k/
+          ...
 ```
 
-`run_manifest.json` 中记录精确的文件路径（`lm_eval_results_file` / `lm_eval_sample_files`），
+`run_manifest.json` 中记录精确的文件路径（`lm_eval_sample_files`），
 汇总脚本只读取 manifest 指向的文件，不递归读取历史文件。
 
-汇总对比（两模型）：
+manifest 关键字段（generation-only 模式）：
+- `evaluation_mode`: `generation_only`
+- `predict_only`: `true`
+- `judging_status`: `pending_local`
+- `server_side_accuracy_valid`: `false`
+- `expected_sample_counts` / `actual_sample_counts`: 动态加载数据集 split 计算的真实数量
+- `successful_attempt_elapsed_seconds`: 成功 attempt 耗时（用于 tokens/s）
+- `gpu_peak_memory_mib`: GPU 峰值显存
+- `fallback_level`: 成功 attempt 使用的 fallback 级别
+
+#### 导出统一 JSONL（本地判分用）
+
+`scripts/export_generation_outputs.py` 将 lm-eval 内部格式导出为统一的 JSONL，
+每个模型每个 benchmark 一个文件，方便后续本地独立判分：
 
 ```
-results/comparison_math500_aime24_aime25_32k.json
-results/comparison_math500_aime24_aime25_32k.csv
-results/comparison_math500_aime24_aime25_32k.md
+results/generated_outputs/
+  limo_math500.jsonl                     # 或 limo_math500_smoke2.jsonl (smoke test)
+  limo_aime24.jsonl
+  limo_aime25.jsonl
+  openr1_math500.jsonl
+  openr1_aime24.jsonl
+  openr1_aime25.jsonl
 ```
 
-汇总表包含：accuracy、avg output tokens、P50/P90/P95 tokens、truncation rate、total time、tokens/s、
-每个正确答案消耗 token 等。`finish_reason` 全部标记为 `unknown`（不根据句末标点猜测 EOS/stop sequence），
-只将 token 数接近 32768 的样本标记为疑似截断。
+每行包含：`model_name`、`task`、`benchmark`、`doc_id`、`sample_id`、`question`、
+`gold_answer`、`gold_solution`、`prompt`、`raw_output`（完整 CoT，不截断）、
+`filtered_output`、`prompt_token_count`、`output_token_count`、`max_gen_toks`、
+`max_model_len`、`possibly_truncated`、生成参数、`prompt_hash`、`output_hash`、
+`run_id`、`git_commit`、`created_at`。
+
+导出采用临时文件 + `os.replace()` 原子写入，导出后重新读取校验行数、JSON 可解析性、
+无重复 `sample_id`、无空输出。
+
+#### 生成对比（两模型）
+
+```
+results/generation_comparison_32k_full.json     # 全量
+results/generation_comparison_32k_full.csv
+results/generation_comparison_32k_full.md
+results/generation_comparison_32k_smoke2.json   # smoke test
+results/generation_comparison_32k_smoke2.csv
+results/generation_comparison_32k_smoke2.md
+```
+
+生成对比表包含：expected/actual samples、empty output count、duplicate count、
+total/avg output tokens、P50/P90/P95/max tokens、possibly truncated count、
+successful attempt wall time、tokens/s、peak GPU memory、fallback level、
+config comparable、throughput comparable、generation complete。
+**不包含 accuracy 对比**（判分在本地独立进行）。
 
 ### 9. 断点保护与强制重跑
 
 - `active_run.json` 存在且 `status=complete` 时默认跳过；
 - `active_run.json` 存在但 `status` 非 complete 时**报错**（不静默覆盖）；
+- **task 级断点恢复**：每个 task 独立调用 lm-eval，task manifest 为 complete 且 JSONL 行数正确、
+  所有输出非空、无重复 doc_id 时跳过该 task，不重跑已完成的 task；
 - `FORCE_RERUN=1` 强制重跑：
   - 新建 run ID（`runs/run_<timestamp>/`）；
   - 不读取旧 run，不删除历史成功结果；
@@ -388,15 +444,20 @@ results/comparison_math500_aime24_aime25_32k.md
 
 两个模型必须使用相同的最终调度配置才能公平比较 tokens/s：
 
-1. LIMO 先通过 fallback 找到成功配置；
+1. LIMO 先通过 fallback 找到成功配置（记录 `fallback_level`）；
 2. OpenR1 使用相同配置（`FORCE_CONFIG`）；
-3. 如果 OpenR1 OOM，走 fallback 找到更保守配置；
+3. 如果 OpenR1 失败（`eval_one` 返回非零），shell 不提前退出（`|| rc=$?` 模式捕获返回码），
+   进入正常 fallback；
 4. 用新配置 `FORCE_RERUN=1` 重跑 LIMO；
 5. 最终 manifest 中 `max_num_batched_tokens` / `max_num_seqs` / `gpu_memory_utilization` /
    `enable_prefix_caching` / `max_model_len` / `max_gen_toks` / `dtype` / `task list` /
    `lm-eval version` / `vLLM version` 必须一致。
 
-输出 `throughput_comparable: true/false`，不一致时禁止给出公平速度结论。
+配置比较使用**Python 数值比较**（`abs(float(gmu1) - float(gmu2)) < 1e-6`），
+不使用 Bash 字符串比较，避免 `0.90` vs `0.9` 格式差异导致误判。
+
+输出 `config_comparable: true/false` / `throughput_comparable: true/false`，
+不一致时禁止给出公平速度结论。
 
 ### 11. 环境诊断
 
@@ -407,7 +468,14 @@ python scripts/diagnose_eval_environment.py
 
 检查 Python / Torch / CUDA / L40 / Transformers / vLLM / lm-eval / PEFT / merged model 完整性 /
 三个本地 task / HF 数据集可访问性 / 磁盘空间 / CPU 内存 / 目标 GPU 空闲。
-输出 `results/environment_diagnostic.json`，关键检查失败返回非零退出码。
+输出 `results/environment_diagnostic.json`。
+
+**关键检查失败（`_fail`）**：Python 版本、torch 兼容性、CUDA 不可用、vllm/lm-eval/transformers/peft
+版本不匹配、pip check 返回非零、CUDA_VISIBLE_DEVICES 包含多个设备、三个本地 task 无法加载。
+
+**警告项（`_warn`）**：GPU 上当前有进程、磁盘空间偏低、合并模型尚未生成、Hugging Face 暂时无法连接。
+
+> generation-only 模式不需要 `math_verify`，已从 `requirements-eval-vllm-cu121.txt` 移除。
 
 ### 12. 旧脚本（仅调试，已废弃）
 

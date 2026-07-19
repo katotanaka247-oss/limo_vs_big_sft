@@ -168,6 +168,15 @@ def main():
         sys.exit(2)
 
     # 2. 输出目录处理
+    # 逻辑:
+    #   out_dir exists and complete:
+    #     not overwrite -> skip (exit 0)
+    #     overwrite     -> continue remerge
+    #   out_dir exists and incomplete:
+    #     not overwrite -> error (exit 3)
+    #     overwrite     -> continue remerge
+    #   out_dir not exists:
+    #     -> continue remerge
     if os.path.isdir(args.out_dir) and is_complete_model(args.out_dir):
         if args.overwrite:
             print(f"[skip-check] 完整模型已存在但 --overwrite 已设置，将重新合并到 {args.out_dir}")
@@ -175,11 +184,14 @@ def main():
             print(f"[skip] 完整 merged 模型已存在于 {args.out_dir}；传 --overwrite 强制重做。")
             sys.exit(0)
     elif os.path.isdir(args.out_dir) and not is_complete_model(args.out_dir):
-        print(f"[ERROR] 输出目录已存在但不是完整模型: {args.out_dir}\n"
-              f"  完整模型需要 config.json + 全部 safetensors 分片(header 合法) + tokenizer 文件。\n"
-              f"  请手动清理该目录后重试，或使用 --overwrite 强制覆盖。",
-              file=sys.stderr)
-        sys.exit(3)
+        if args.overwrite:
+            print(f"[overwrite] 输出目录已存在但不完整: {args.out_dir}，--overwrite 已设置，将重新合并。")
+        else:
+            print(f"[ERROR] 输出目录已存在但不是完整模型: {args.out_dir}\n"
+                  f"  完整模型需要 config.json + 全部 safetensors 分片(header 合法) + tokenizer 文件。\n"
+                  f"  请手动清理该目录后重试，或使用 --overwrite 强制覆盖。",
+                  file=sys.stderr)
+            sys.exit(3)
 
     # 3. 原子保存：先写临时目录
     out_parent = os.path.dirname(os.path.abspath(args.out_dir))
@@ -229,8 +241,12 @@ def main():
         dtypes = {str(dt) for dt in [p.dtype for p in merged_model.parameters()]}
 
         # 8. 原子替换正式目录
-        # 若 --overwrite 且正式目录已存在完整模型，先备份再替换
+        # 顺序: 临时目录保存 → 临时目录验证 → 旧目录重命名为 backup →
+        #       临时目录移动到正式目录 → 正式目录再次验证 → 验证成功后删除 backup
+        # 若正式验证失败: 删除新目录 → 恢复 backup → 返回非零
+        # 不能在正式目录最终验证之前删除 backup
         final_replace = False
+        backup = None
         if os.path.isdir(args.out_dir):
             backup = args.out_dir + f".bak_{os.getpid()}"
             print(f"[atomic] 备份旧目录 {args.out_dir} -> {backup}")
@@ -238,13 +254,11 @@ def main():
             try:
                 shutil.move(tmp_dir, args.out_dir)
                 final_replace = True
-                shutil.rmtree(backup)
-                print(f"[atomic] 已删除备份 {backup}")
             except Exception as e:
-                # 替换失败，回滚
+                # 替换失败，回滚旧目录
                 print(f"[ERROR] 原子替换失败 ({e})，回滚旧目录", file=sys.stderr)
                 if os.path.isdir(args.out_dir):
-                    shutil.rmtree(args.out_dir)
+                    shutil.rmtree(args.out_dir, ignore_errors=True)
                 shutil.move(backup, args.out_dir)
                 raise
         else:
@@ -254,9 +268,21 @@ def main():
         if not final_replace:
             raise RuntimeError("原子替换未完成")
 
-        # 9. 最终复核
+        # 9. 最终复核（在删除 backup 之前）
         if not is_complete_model(args.out_dir):
+            # 正式验证失败：删除新目录，恢复 backup
+            print(f"[ERROR] 替换后正式目录不完整: {args.out_dir}", file=sys.stderr)
+            print(f"[rollback] 删除新目录，恢复 backup ...", file=sys.stderr)
+            if os.path.isdir(args.out_dir):
+                shutil.rmtree(args.out_dir, ignore_errors=True)
+            if backup and os.path.isdir(backup):
+                shutil.move(backup, args.out_dir)
             raise RuntimeError(f"替换后正式目录不完整: {args.out_dir}")
+
+        # 10. 正式验证通过后才删除 backup
+        if backup and os.path.isdir(backup):
+            shutil.rmtree(backup, ignore_errors=True)
+            print(f"[atomic] 正式目录验证通过，已删除备份 {backup}")
 
         print("\n" + "=" * 60)
         print("Merge DONE")

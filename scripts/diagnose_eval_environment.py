@@ -81,7 +81,8 @@ def check_torch(checks):
         if v.startswith("2.5.1") and cuda_v == "12.1":
             _ok(checks, "torch", detail)
         else:
-            _warn(checks, "torch", {**detail, "expected": "2.5.1+cu121"})
+            # 关键：torch 版本不兼容必须 fail
+            _fail(checks, "torch", {**detail, "expected": "2.5.1+cu121"})
     except ImportError:
         _fail(checks, "torch", {"error": "torch not installed"})
 
@@ -112,19 +113,31 @@ def check_gpu(checks):
 
 
 def check_packages(checks):
-    pkgs = {
+    # 关键包：版本不匹配必须 fail
+    # 非关键包：版本不匹配只 warn
+    critical_pkgs = {
         "transformers": "4.46.3",
         "vllm": "0.6.6.post1",
         "lm_eval": "0.4.5",
         "peft": "0.13.2",
+    }
+    non_critical_pkgs = {
         "accelerate": "1.1.1",
         "datasets": "2.20.0",
         "safetensors": None,
     }
-    for pkg, expected in pkgs.items():
+    for pkg, expected in critical_pkgs.items():
         v = _version(pkg)
         if v is None:
             _fail(checks, f"pkg_{pkg}", {"error": "not installed"})
+        elif expected and v != expected:
+            _fail(checks, f"pkg_{pkg}", {"version": v, "expected": expected})
+        else:
+            _ok(checks, f"pkg_{pkg}", {"version": v})
+    for pkg, expected in non_critical_pkgs.items():
+        v = _version(pkg)
+        if v is None:
+            _warn(checks, f"pkg_{pkg}", {"error": "not installed"})
         elif expected and v != expected:
             _warn(checks, f"pkg_{pkg}", {"version": v, "expected": expected})
         else:
@@ -190,6 +203,17 @@ def check_local_tasks(checks):
         import yaml
     except ImportError:
         yaml = None
+
+    # 自定义 YAML loader 处理 !function 标签
+    if yaml:
+        class _FunctionLoader(yaml.SafeLoader):
+            pass
+        def _construct_function(loader, node):
+            if isinstance(node, yaml.ScalarNode):
+                return loader.construct_scalar(node)
+            return str(node.value)
+        _FunctionLoader.add_constructor("!function", _construct_function)
+
     for task in REQUIRED_TASKS:
         name = f"local_task_{task}"
         yamls = glb.glob(str(EVAL_TASKS_DIR / "*.yaml"))
@@ -198,7 +222,7 @@ def check_local_tasks(checks):
             try:
                 content = Path(yp).read_text(encoding="utf-8")
                 if yaml:
-                    data = yaml.safe_load(content)
+                    data = yaml.load(content, Loader=_FunctionLoader)
                     if data and data.get("task") == task:
                         found = True
                         _ok(checks, name, {"yaml": yp, "task": task})
@@ -331,7 +355,7 @@ def check_gpu_free(checks):
 
 
 def check_pip_conflicts(checks):
-    """运行 pip check 检测依赖冲突。"""
+    """运行 pip check 检测依赖冲突。pip check 返回非零是关键问题。"""
     try:
         result = subprocess.run(
             [sys.executable, "-m", "pip", "check"],
@@ -340,7 +364,8 @@ def check_pip_conflicts(checks):
         if result.returncode == 0:
             _ok(checks, "pip_check", {"status": "no conflicts"})
         else:
-            _warn(checks, "pip_check", {
+            # 关键：pip check 冲突必须 fail
+            _fail(checks, "pip_check", {
                 "status": "conflicts detected",
                 "output": result.stdout[:500],
             })
